@@ -69,7 +69,7 @@ func (tm *TableManager) persistTableMeta(table *Table, firstDataPage uint32) err
 	
 	// 简单方案：每次重写全部表定义
 	allMetas := make([]map[string]interface{}, 0)
-	count := binary.LittleEndian.Uint32(metaPage.Data()[4:8])
+	count := binary.LittleEndian.Uint32(metaPage.Data()[0:4])
 	if count > 0 {
 		// 解析现有的（从 Data()[8:] 开始）
 		existing := metaPage.Data()[8:]
@@ -98,14 +98,14 @@ func (tm *TableManager) persistTableMeta(table *Table, firstDataPage uint32) err
 	}
 	
 	// page 0 data area layout:
-	// Data()[0:4]  = data[16:20] = nextPageID (managed by Pager, DON'T TOUCH)
-	// Data()[4:8]  = data[20:24] = tableCount
+	// Data()[0:4]  = data[16:20] = tableCount
+	// Data()[4:8]  = data[20:24] = nextPageID (managed by Pager, DON'T TOUCH)
 	// Data()[8:]   = data[24:]   = 表元数据 JSON
 	if len(allJSON) > len(metaPage.Data())-8 {
 		return fmt.Errorf("table metadata too large for page 0")
 	}
 	
-	binary.LittleEndian.PutUint32(metaPage.Data()[4:8], uint32(len(allMetas)))
+	binary.LittleEndian.PutUint32(metaPage.Data()[0:4], uint32(len(allMetas)))
 	copy(metaPage.Data()[8:], allJSON)
 	metaPage.SetDirty(true)
 	
@@ -118,10 +118,19 @@ func (tm *TableManager) GetTable(name string) (*Table, bool) {
 	return t, ok
 }
 
+// ListTables 返回所有表名
+func (tm *TableManager) ListTables() []string {
+	names := make([]string, 0, len(tm.tables))
+	for name := range tm.tables {
+		names = append(names, name)
+	}
+	return names
+}
+
 // LoadTables 从磁盘恢复所有表定义
 func (tm *TableManager) LoadTables() error {
 	metaPage := tm.pager.GetPage(0)
-	count := binary.LittleEndian.Uint32(metaPage.Data()[4:8])
+	count := binary.LittleEndian.Uint32(metaPage.Data()[0:4])
 	if count == 0 {
 		return nil
 	}
@@ -351,7 +360,7 @@ func (tm *TableManager) readRowsFromPage(page *Page, table *Table) ([]*Row, erro
 // getFirstDataPage 从表元数据获取首数据页ID（简化：从 page 0 的 JSON 中解析）
 func (tm *TableManager) getFirstDataPage(tableName string) uint32 {
 	metaPage := tm.pager.GetPage(0)
-	count := binary.LittleEndian.Uint32(metaPage.Data()[4:8])
+	count := binary.LittleEndian.Uint32(metaPage.Data()[0:4])
 	if count == 0 {
 		return 0
 	}
