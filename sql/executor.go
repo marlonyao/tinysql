@@ -82,7 +82,7 @@ func parseColumnType(s string) (storage.ColumnType, error) {
 	switch strings.ToUpper(s) {
 	case "INT":
 		return storage.TypeInt, nil
-	case "VARCHAR":
+	case "VARCHAR", "TEXT":
 		return storage.TypeVarchar, nil
 	case "BOOL":
 		return storage.TypeBool, nil

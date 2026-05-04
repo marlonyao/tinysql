@@ -97,7 +97,7 @@ var keywords = map[string]struct{}{
 	"CREATE": {}, "TABLE": {}, "INSERT": {}, "INTO": {},
 	"SELECT": {}, "FROM": {}, "WHERE": {}, "AND": {},
 	"OR": {}, "NOT": {}, "NULL": {}, "INT": {},
-	"VARCHAR": {}, "BOOL": {}, "VALUES": {}, "TRUE": {},
+	"VARCHAR": {}, "TEXT": {}, "BOOL": {}, "VALUES": {}, "TRUE": {},
 	"FALSE": {}, "PRIMARY": {}, "KEY": {},
 }
 
