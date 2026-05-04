@@ -1,244 +1,191 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"sort"
 )
 
-const (
-	NodeTypeLeaf     = 1
-	NodeTypeInternal = 2
-)
+const NodeTypeLeaf byte = 1
+const NodeTypeInternal byte = 2
 
-// B+Tree Node Header 在 page.Data() 中的偏移
-const (
-	offNumKeys      = 0
-	offNodeType     = 2
-	offRightSibling = 3
-	offLeftSibling  = 7
-	offParent       = 11
-	offIsRoot       = 15
-	offFirstChild   = 16 // 内部节点：最左孩子页ID
-	offFreeOffset   = 16 // 叶子节点：空闲区起始（与 offFirstChild 复用）
+// NodeHeader 布局 (32 bytes)
+// [0:1]   nodeType (1=leaf, 2=internal)
+// [1:2]   flags
+// [2:4]   numKeys (uint16)
+// [4:8]   parentPageID (uint32)
+// [8:12]  rightSibling (uint32)
+// [12:16] leftSibling (uint32)
+// [16:20] firstChild (uint32) — 仅内部节点使用
+// [20:32] reserved
 
-	NodeHeaderSize = 20
-)
+const NodeHeaderSize = 32
 
-// KVPair key-value 对
-type KVPair struct {
-	Key   int
-	Value []byte
+type leafEntry struct {
+	key   []byte
+	value []byte
 }
 
-// BTree 基于 Page 的 B+Tree
-type BTree struct {
-	pager      *Pager
-	rootPageID uint32
+type internalEntry struct {
+	key         []byte
+	childPageID uint32
 }
 
-// nodeAccessor 封装对 B+Tree 节点页的操作
 type nodeAccessor struct {
 	page *Page
 	data []byte
 }
 
 func newNodeAccessor(page *Page) *nodeAccessor {
-	return &nodeAccessor{
-		page: page,
-		data: page.Data(),
-	}
+	return &nodeAccessor{page: page, data: page.Data()}
 }
 
-// === Node Header 读写 ===
+func (na *nodeAccessor) nodeType() byte     { return na.data[0] }
+func (na *nodeAccessor) numKeys() uint16     { return binary.LittleEndian.Uint16(na.data[2:4]) }
+func (na *nodeAccessor) parent() uint32      { return binary.LittleEndian.Uint32(na.data[4:8]) }
+func (na *nodeAccessor) rightSibling() uint32 { return binary.LittleEndian.Uint32(na.data[8:12]) }
+func (na *nodeAccessor) leftSibling() uint32  { return binary.LittleEndian.Uint32(na.data[12:16]) }
+func (na *nodeAccessor) firstChild() uint32    { return binary.LittleEndian.Uint32(na.data[16:20]) }
+func (na *nodeAccessor) isRoot() bool         { return na.parent() == 0 }
 
-func (na *nodeAccessor) numKeys() int {
-	return int(binary.LittleEndian.Uint16(na.data[offNumKeys : offNumKeys+2]))
-}
-func (na *nodeAccessor) setNumKeys(v int) {
-	binary.LittleEndian.PutUint16(na.data[offNumKeys:offNumKeys+2], uint16(v))
-}
-func (na *nodeAccessor) nodeType() byte     { return na.data[offNodeType] }
-func (na *nodeAccessor) setNodeType(t byte) { na.data[offNodeType] = t }
-func (na *nodeAccessor) rightSibling() uint32 {
-	return binary.LittleEndian.Uint32(na.data[offRightSibling : offRightSibling+4])
-}
-func (na *nodeAccessor) setRightSibling(v uint32) {
-	binary.LittleEndian.PutUint32(na.data[offRightSibling:offRightSibling+4], v)
-}
-func (na *nodeAccessor) leftSibling() uint32 {
-	return binary.LittleEndian.Uint32(na.data[offLeftSibling : offLeftSibling+4])
-}
-func (na *nodeAccessor) setLeftSibling(v uint32) {
-	binary.LittleEndian.PutUint32(na.data[offLeftSibling:offLeftSibling+4], v)
-}
-func (na *nodeAccessor) parent() uint32 {
-	return binary.LittleEndian.Uint32(na.data[offParent : offParent+4])
-}
-func (na *nodeAccessor) setParent(v uint32) {
-	binary.LittleEndian.PutUint32(na.data[offParent:offParent+4], v)
-}
-func (na *nodeAccessor) isRoot() bool       { return na.data[offIsRoot] != 0 }
-func (na *nodeAccessor) setIsRoot(v bool) {
-	if v {
-		na.data[offIsRoot] = 1
-	} else {
-		na.data[offIsRoot] = 0
-	}
-}
-func (na *nodeAccessor) firstChild() uint32 {
-	return binary.LittleEndian.Uint32(na.data[offFirstChild : offFirstChild+4])
-}
-func (na *nodeAccessor) setFirstChild(v uint32) {
-	binary.LittleEndian.PutUint32(na.data[offFirstChild:offFirstChild+4], v)
-}
-func (na *nodeAccessor) freeOffset() uint16 {
-	return binary.LittleEndian.Uint16(na.data[offFreeOffset : offFreeOffset+2])
-}
-func (na *nodeAccessor) setFreeOffset(v uint16) {
-	binary.LittleEndian.PutUint16(na.data[offFreeOffset:offFreeOffset+2], v)
-}
-
-// === 节点初始化 ===
+func (na *nodeAccessor) setNodeType(t byte)      { na.data[0] = t }
+func (na *nodeAccessor) setNumKeys(n uint16)     { binary.LittleEndian.PutUint16(na.data[2:4], n) }
+func (na *nodeAccessor) setParent(p uint32)      { binary.LittleEndian.PutUint32(na.data[4:8], p) }
+func (na *nodeAccessor) setRightSibling(r uint32) { binary.LittleEndian.PutUint32(na.data[8:12], r) }
+func (na *nodeAccessor) setLeftSibling(l uint32)  { binary.LittleEndian.PutUint32(na.data[12:16], l) }
+func (na *nodeAccessor) setFirstChild(f uint32)   { binary.LittleEndian.PutUint32(na.data[16:20], f) }
 
 func initLeafNode(page *Page) {
 	na := newNodeAccessor(page)
-	na.setNumKeys(0)
 	na.setNodeType(NodeTypeLeaf)
+	na.setNumKeys(0)
+	na.setParent(0)
 	na.setRightSibling(0)
 	na.setLeftSibling(0)
-	na.setParent(0)
-	na.setIsRoot(true)
-	na.setFreeOffset(NodeHeaderSize)
+	na.setFirstChild(0)
 }
 
 func initInternalNode(page *Page, isRoot bool) {
 	na := newNodeAccessor(page)
-	na.setNumKeys(0)
 	na.setNodeType(NodeTypeInternal)
+	na.setNumKeys(0)
+	if isRoot {
+		na.setParent(0)
+	}
 	na.setRightSibling(0)
 	na.setLeftSibling(0)
-	na.setParent(0)
-	na.setIsRoot(isRoot)
 	na.setFirstChild(0)
 }
 
-// === 叶子节点 Entry 操作 ===
-
-type leafEntry struct {
-	key   int
-	value []byte
-}
-
-// leafEntries 读取叶子节点所有 entry
+// leafEntries 读取所有叶子 entry
 func (na *nodeAccessor) leafEntries() []leafEntry {
-	n := na.numKeys()
-	entries := make([]leafEntry, 0, n)
+	count := int(na.numKeys())
+	entries := make([]leafEntry, 0, count)
 	offset := NodeHeaderSize
-	for i := 0; i < n; i++ {
-		key := int(binary.LittleEndian.Uint32(na.data[offset : offset+4]))
-		offset += 4
-		valLen := int(binary.LittleEndian.Uint16(na.data[offset : offset+2]))
+	for i := 0; i < count; i++ {
+		keyLen := binary.LittleEndian.Uint16(na.data[offset : offset+2])
+		offset += 2
+		key := make([]byte, keyLen)
+		copy(key, na.data[offset:offset+int(keyLen)])
+		offset += int(keyLen)
+		valLen := binary.LittleEndian.Uint16(na.data[offset : offset+2])
 		offset += 2
 		value := make([]byte, valLen)
-		copy(value, na.data[offset:offset+valLen])
-		offset += valLen
+		copy(value, na.data[offset:offset+int(valLen)])
+		offset += int(valLen)
 		entries = append(entries, leafEntry{key: key, value: value})
 	}
 	return entries
 }
 
-// setLeafEntries 覆盖写入所有 entry
+// setLeafEntries 覆盖写入
 func (na *nodeAccessor) setLeafEntries(entries []leafEntry) {
-	na.setNumKeys(len(entries))
+	na.setNumKeys(uint16(len(entries)))
 	offset := NodeHeaderSize
 	for _, e := range entries {
-		binary.LittleEndian.PutUint32(na.data[offset:offset+4], uint32(e.key))
-		offset += 4
+		binary.LittleEndian.PutUint16(na.data[offset:offset+2], uint16(len(e.key)))
+		offset += 2
+		copy(na.data[offset:], e.key)
+		offset += len(e.key)
 		binary.LittleEndian.PutUint16(na.data[offset:offset+2], uint16(len(e.value)))
 		offset += 2
 		copy(na.data[offset:], e.value)
 		offset += len(e.value)
 	}
-	na.setFreeOffset(uint16(offset))
 }
 
-// tryInsertLeafEntry 尝试插入/替换叶子 entry。返回 false 表示页满
-func (na *nodeAccessor) tryInsertLeafEntry(key int, value []byte) bool {
+// tryInsertLeafEntry 尝试插入/更新。返回 false 表示页满
+func (na *nodeAccessor) tryInsertLeafEntry(key []byte, value []byte) bool {
 	entries := na.leafEntries()
 
-	// 二分查找位置
 	idx := sort.Search(len(entries), func(i int) bool {
-		return entries[i].key >= key
+		return bytes.Compare(entries[i].key, key) >= 0
 	})
 
-	if idx < len(entries) && entries[idx].key == key {
-		entries[idx].value = value // 替换
+	if idx < len(entries) && bytes.Equal(entries[idx].key, key) {
+		entries[idx].value = value
 	} else {
-		// 插入
 		entries = append(entries, leafEntry{})
 		copy(entries[idx+1:], entries[idx:])
 		entries[idx] = leafEntry{key: key, value: value}
 	}
 
-	// 计算所需空间
 	size := NodeHeaderSize
 	for _, e := range entries {
-		size += 4 + 2 + len(e.value)
+		size += 2 + len(e.key) + 2 + len(e.value)
 	}
 	if size > len(na.data) {
-		return false // 页满
+		return false
 	}
 
 	na.setLeafEntries(entries)
 	return true
 }
 
-// === 内部节点 Entry 操作 ===
-
-type internalEntry struct {
-	key         int
-	childPageID uint32
-}
-
-// internalEntries 读取内部节点所有 entry（不含 firstChild）
+// internalEntries 读取所有内部 entry
 func (na *nodeAccessor) internalEntries() []internalEntry {
-	n := na.numKeys()
-	entries := make([]internalEntry, 0, n)
-	offset := NodeHeaderSize + 4 // 跳过 firstChild
-	for i := 0; i < n; i++ {
-		key := int(binary.LittleEndian.Uint32(na.data[offset : offset+4]))
+	count := int(na.numKeys())
+	entries := make([]internalEntry, 0, count)
+	offset := NodeHeaderSize + 4
+	for i := 0; i < count; i++ {
+		keyLen := binary.LittleEndian.Uint16(na.data[offset : offset+2])
+		offset += 2
+		key := make([]byte, keyLen)
+		copy(key, na.data[offset:offset+int(keyLen)])
+		offset += int(keyLen)
+		childPageID := binary.LittleEndian.Uint32(na.data[offset : offset+4])
 		offset += 4
-		child := binary.LittleEndian.Uint32(na.data[offset : offset+4])
-		offset += 4
-		entries = append(entries, internalEntry{key: key, childPageID: child})
+		entries = append(entries, internalEntry{key: key, childPageID: childPageID})
 	}
 	return entries
 }
 
 // setInternalEntries 覆盖写入
 func (na *nodeAccessor) setInternalEntries(firstChild uint32, entries []internalEntry) {
-	na.setNumKeys(len(entries))
+	na.setNumKeys(uint16(len(entries)))
 	na.setFirstChild(firstChild)
 	offset := NodeHeaderSize + 4
 	for _, e := range entries {
-		binary.LittleEndian.PutUint32(na.data[offset:offset+4], uint32(e.key))
-		offset += 4
+		binary.LittleEndian.PutUint16(na.data[offset:offset+2], uint16(len(e.key)))
+		offset += 2
+		copy(na.data[offset:], e.key)
+		offset += len(e.key)
 		binary.LittleEndian.PutUint32(na.data[offset:offset+4], e.childPageID)
 		offset += 4
 	}
 }
 
 // tryInsertInternalEntry 尝试插入内部 entry。返回 false 表示页满
-func (na *nodeAccessor) tryInsertInternalEntry(key int, childPageID uint32) bool {
+func (na *nodeAccessor) tryInsertInternalEntry(key []byte, childPageID uint32) bool {
 	entries := na.internalEntries()
 	firstChild := na.firstChild()
 
 	idx := sort.Search(len(entries), func(i int) bool {
-		return entries[i].key >= key
+		return bytes.Compare(entries[i].key, key) >= 0
 	})
 
-	if idx < len(entries) && entries[idx].key == key {
+	if idx < len(entries) && bytes.Equal(entries[idx].key, key) {
 		entries[idx].childPageID = childPageID // 替换
 	} else {
 		entries = append(entries, internalEntry{})
@@ -246,8 +193,10 @@ func (na *nodeAccessor) tryInsertInternalEntry(key int, childPageID uint32) bool
 		entries[idx] = internalEntry{key: key, childPageID: childPageID}
 	}
 
-	// 内部节点每个 entry 8 bytes + firstChild 4 bytes + header 20 bytes
-	size := NodeHeaderSize + 4 + len(entries)*8
+	size := NodeHeaderSize + 4
+	for _, e := range entries {
+		size += 2 + len(e.key) + 4
+	}
 	if size > len(na.data) {
 		return false
 	}
@@ -256,7 +205,17 @@ func (na *nodeAccessor) tryInsertInternalEntry(key int, childPageID uint32) bool
 	return true
 }
 
-// === BTree 对外接口 ===
+// KVPair key-value 对
+type KVPair struct {
+	Key   []byte
+	Value []byte
+}
+
+// BTree B+Tree 索引
+type BTree struct {
+	pager      *Pager
+	rootPageID uint32
+}
 
 // NewBTree 创建新的 B+Tree（分配根叶子节点）
 func NewBTree(pager *Pager) *BTree {
@@ -274,7 +233,7 @@ func LoadBTree(pager *Pager, rootPageID uint32) *BTree {
 }
 
 // Search 查找 key
-func (bt *BTree) Search(key int) ([]byte, bool, error) {
+func (bt *BTree) Search(key []byte) ([]byte, bool, error) {
 	pageID := bt.rootPageID
 	for {
 		page := bt.pager.GetPage(pageID)
@@ -283,9 +242,9 @@ func (bt *BTree) Search(key int) ([]byte, bool, error) {
 		if na.nodeType() == NodeTypeLeaf {
 			entries := na.leafEntries()
 			idx := sort.Search(len(entries), func(i int) bool {
-				return entries[i].key >= key
+				return bytes.Compare(entries[i].key, key) >= 0
 			})
-			if idx < len(entries) && entries[idx].key == key {
+			if idx < len(entries) && bytes.Equal(entries[idx].key, key) {
 				return entries[idx].value, true, nil
 			}
 			return nil, false, nil
@@ -295,27 +254,56 @@ func (bt *BTree) Search(key int) ([]byte, bool, error) {
 		entries := na.internalEntries()
 		firstChild := na.firstChild()
 
-		if len(entries) == 0 {
-			pageID = firstChild
-			continue
-		}
-
-		if key < entries[0].key {
-			pageID = firstChild
-		} else {
-			pageID = entries[len(entries)-1].childPageID
-			for i := len(entries) - 2; i >= 0; i-- {
-				if key >= entries[i].key {
-					pageID = entries[i].childPageID
-					break
-				}
+		pageID = firstChild
+		for i := 0; i < len(entries); i++ {
+			if bytes.Compare(key, entries[i].key) >= 0 {
+				pageID = entries[i].childPageID
+			} else {
+				break
 			}
 		}
 	}
 }
 
-// RangeScan 范围扫描 [start, end]
-func (bt *BTree) RangeScan(start, end int) ([]KVPair, error) {
+// Delete 删除 key
+func (bt *BTree) Delete(key []byte) error {
+	pageID := bt.rootPageID
+	for {
+		page := bt.pager.GetPage(pageID)
+		na := newNodeAccessor(page)
+
+		if na.nodeType() == NodeTypeLeaf {
+			entries := na.leafEntries()
+			idx := sort.Search(len(entries), func(i int) bool {
+				return bytes.Compare(entries[i].key, key) >= 0
+			})
+			if idx < len(entries) && bytes.Equal(entries[idx].key, key) {
+				// 删除 entry
+				entries = append(entries[:idx], entries[idx+1:]...)
+				na.setLeafEntries(entries)
+				na.page.SetDirty(true)
+				return bt.pager.Flush(page.ID())
+			}
+			return nil // key not found, nothing to delete
+		}
+
+		// 内部节点：选择子节点
+		entries := na.internalEntries()
+		firstChild := na.firstChild()
+
+		pageID = firstChild
+		for i := 0; i < len(entries); i++ {
+			if bytes.Compare(key, entries[i].key) >= 0 {
+				pageID = entries[i].childPageID
+			} else {
+				break
+			}
+		}
+	}
+}
+
+// RangeScan 范围扫描 [start, end]（字节序比较）
+func (bt *BTree) RangeScan(start, end []byte) ([]KVPair, error) {
 	// 找到包含 start 的叶子节点
 	pageID := bt.rootPageID
 	for {
@@ -326,15 +314,12 @@ func (bt *BTree) RangeScan(start, end int) ([]KVPair, error) {
 		}
 		entries := na.internalEntries()
 		firstChild := na.firstChild()
-		if len(entries) == 0 || start < entries[0].key {
-			pageID = firstChild
-		} else {
-			pageID = entries[len(entries)-1].childPageID
-			for i := len(entries) - 2; i >= 0; i-- {
-				if start >= entries[i].key {
-					pageID = entries[i].childPageID
-					break
-				}
+		pageID = firstChild
+		for i := 0; i < len(entries); i++ {
+			if bytes.Compare(start, entries[i].key) >= 0 {
+				pageID = entries[i].childPageID
+			} else {
+				break
 			}
 		}
 	}
@@ -344,37 +329,35 @@ func (bt *BTree) RangeScan(start, end int) ([]KVPair, error) {
 		page := bt.pager.GetPage(pageID)
 		na := newNodeAccessor(page)
 		entries := na.leafEntries()
-
 		for _, e := range entries {
-			if e.key < start {
+			if bytes.Compare(e.key, start) < 0 {
 				continue
 			}
-			if e.key > end {
+			if bytes.Compare(e.key, end) > 0 {
 				return results, nil
 			}
 			results = append(results, KVPair{Key: e.key, Value: e.value})
 		}
-
 		pageID = na.rightSibling()
 	}
 	return results, nil
 }
 
 // Insert 插入 key-value
-func (bt *BTree) Insert(key int, value []byte) error {
-	rootPage := bt.pager.GetPage(bt.rootPageID)
-	newRoot, err := bt.insertIntoNode(rootPage, key, value)
+func (bt *BTree) Insert(key []byte, value []byte) error {
+	page := bt.pager.GetPage(bt.rootPageID)
+	newRootID, err := bt.insertIntoNode(page, key, value)
 	if err != nil {
 		return err
 	}
-	if newRoot != 0 {
-		bt.rootPageID = newRoot
+	if newRootID != 0 {
+		bt.rootPageID = newRootID
 	}
 	return nil
 }
 
 // insertIntoNode 递归插入。返回 (newRootPageID, error)
-func (bt *BTree) insertIntoNode(page *Page, key int, value []byte) (uint32, error) {
+func (bt *BTree) insertIntoNode(page *Page, key []byte, value []byte) (uint32, error) {
 	na := newNodeAccessor(page)
 
 	if na.nodeType() == NodeTypeLeaf {
@@ -391,16 +374,12 @@ func (bt *BTree) insertIntoNode(page *Page, key int, value []byte) (uint32, erro
 	entries := na.internalEntries()
 	firstChild := na.firstChild()
 
-	var childPageID uint32
-	if len(entries) == 0 || key < entries[0].key {
-		childPageID = firstChild
-	} else {
-		childPageID = entries[len(entries)-1].childPageID
-		for i := len(entries) - 2; i >= 0; i-- {
-			if key >= entries[i].key {
-				childPageID = entries[i].childPageID
-				break
-			}
+	childPageID := firstChild
+	for i := 0; i < len(entries); i++ {
+		if bytes.Compare(key, entries[i].key) >= 0 {
+			childPageID = entries[i].childPageID
+		} else {
+			break
 		}
 	}
 
@@ -415,7 +394,7 @@ func (bt *BTree) insertIntoNode(page *Page, key int, value []byte) (uint32, erro
 
 	// 子节点分裂了，需要把 newChildPageID 和它的最小 key 插入当前内部节点
 	newChildNa := newNodeAccessor(bt.pager.GetPage(newChildPageID))
-	var splitKey int
+	var splitKey []byte
 	if newChildNa.nodeType() == NodeTypeLeaf {
 		childEntries := newChildNa.leafEntries()
 		if len(childEntries) > 0 {
@@ -426,7 +405,7 @@ func (bt *BTree) insertIntoNode(page *Page, key int, value []byte) (uint32, erro
 		if len(childEntries) > 0 {
 			splitKey = childEntries[0].key
 		} else {
-			splitKey = int(newChildPageID) // fallback
+			splitKey = encodeIntKey(int(newChildPageID)) // fallback
 		}
 	}
 
@@ -441,15 +420,15 @@ func (bt *BTree) insertIntoNode(page *Page, key int, value []byte) (uint32, erro
 }
 
 // splitLeaf 分裂叶子节点。返回 (newRootPageID, error)
-func (bt *BTree) splitLeaf(page *Page, key int, value []byte) (uint32, error) {
+func (bt *BTree) splitLeaf(page *Page, key []byte, value []byte) (uint32, error) {
 	na := newNodeAccessor(page)
 	entries := na.leafEntries()
 
 	// 找到插入位置
 	idx := sort.Search(len(entries), func(i int) bool {
-		return entries[i].key >= key
+		return bytes.Compare(entries[i].key, key) >= 0
 	})
-	if idx < len(entries) && entries[idx].key == key {
+	if idx < len(entries) && bytes.Equal(entries[idx].key, key) {
 		entries[idx].value = value
 	} else {
 		entries = append(entries, leafEntry{})
@@ -469,25 +448,29 @@ func (bt *BTree) splitLeaf(page *Page, key int, value []byte) (uint32, error) {
 	}
 	newPage := bt.pager.GetPage(newPageID)
 	initLeafNode(newPage)
+
+	// 写入右半数据
 	newNa := newNodeAccessor(newPage)
 	newNa.setLeafEntries(rightEntries)
-	newNa.setLeftSibling(page.ID())
-	newNa.setRightSibling(na.rightSibling())
+	newNa.setRightSibling(na.rightSibling()) // 新节点的右兄弟 = 原节点的右兄弟
+	newNa.setLeftSibling(page.ID())          // 新节点的左兄弟 = 原节点
 	newNa.setParent(na.parent())
 	newNa.page.SetDirty(true)
 
 	// 更新原页
 	na.setLeafEntries(leftEntries)
-	na.setRightSibling(newPageID)
+	na.setRightSibling(newPageID) // 原节点的右兄弟 = 新节点
 	na.page.SetDirty(true)
 
-	// 更新右兄弟的左指针
+	// 更新原节点的右兄弟的左兄弟指针
 	if newNa.rightSibling() != 0 {
-		rsPage := bt.pager.GetPage(newNa.rightSibling())
-		rsNa := newNodeAccessor(rsPage)
-		rsNa.setLeftSibling(newPageID)
-		rsPage.SetDirty(true)
-		bt.pager.Flush(newNa.rightSibling())
+		rightSiblingPage := bt.pager.GetPage(newNa.rightSibling())
+		rightSiblingNa := newNodeAccessor(rightSiblingPage)
+		rightSiblingNa.setLeftSibling(newPageID)
+		rightSiblingPage.SetDirty(true)
+		if err := bt.pager.Flush(rightSiblingPage.ID()); err != nil {
+			return 0, err
+		}
 	}
 
 	if err := bt.pager.Flush(page.ID()); err != nil {
@@ -504,22 +487,29 @@ func (bt *BTree) splitLeaf(page *Page, key int, value []byte) (uint32, error) {
 		return bt.createNewRoot(page.ID(), splitKey, newPageID)
 	}
 
-	// 递归插入父节点
+	// 直接在父节点插入 internal entry
 	parentPage := bt.pager.GetPage(na.parent())
-	return bt.insertIntoNode(parentPage, splitKey, nil) // value=nil 表示内部节点插入
+	parentNa := newNodeAccessor(parentPage)
+	if parentNa.tryInsertInternalEntry(splitKey, newPageID) {
+		parentNa.page.SetDirty(true)
+		return 0, bt.pager.Flush(parentPage.ID())
+	}
+
+	// 父节点也满了，分裂
+	return bt.splitInternal(parentPage, splitKey, newPageID)
 }
 
 // splitInternal 分裂内部节点。返回 (newRootPageID, error)
-func (bt *BTree) splitInternal(page *Page, key int, childPageID uint32) (uint32, error) {
+func (bt *BTree) splitInternal(page *Page, key []byte, childPageID uint32) (uint32, error) {
 	na := newNodeAccessor(page)
 	entries := na.internalEntries()
 	firstChild := na.firstChild()
 
 	// 在合适位置插入新 entry
 	idx := sort.Search(len(entries), func(i int) bool {
-		return entries[i].key >= key
+		return bytes.Compare(entries[i].key, key) >= 0
 	})
-	if idx < len(entries) && entries[idx].key == key {
+	if idx < len(entries) && bytes.Equal(entries[idx].key, key) {
 		entries[idx].childPageID = childPageID
 	} else {
 		entries = append(entries, internalEntry{})
@@ -568,32 +558,25 @@ func (bt *BTree) splitInternal(page *Page, key int, childPageID uint32) (uint32,
 	}
 
 	parentPage := bt.pager.GetPage(na.parent())
-	// 这里有个问题：insertIntoNode 期望插入 key-value，但内部节点插入是 key-child
-	// 我需要修改内部节点的处理...
-	
-	// 简化：直接递归调用，但用特殊标记？
-	// 实际上不应该递归到 insertIntoNode，因为父节点也是内部节点
-	// 应该直接在父节点插入 (promoteKey, newPageID)
-	
 	parentNa := newNodeAccessor(parentPage)
 	if parentNa.tryInsertInternalEntry(promoteKey, newPageID) {
 		parentNa.page.SetDirty(true)
 		return 0, bt.pager.Flush(parentPage.ID())
 	}
-	
-	// 父节点也满了，递归分裂
+
+	// 祖父节点也满了，递归分裂
 	return bt.splitInternal(parentPage, promoteKey, newPageID)
 }
 
-// createNewRoot 创建新的根内部节点
-func (bt *BTree) createNewRoot(leftPageID uint32, key int, rightPageID uint32) (uint32, error) {
+// createNewRoot 创建新的根节点
+func (bt *BTree) createNewRoot(leftPageID uint32, key []byte, rightPageID uint32) (uint32, error) {
 	newRootID, err := bt.pager.Allocate()
 	if err != nil {
-		return 0, fmt.Errorf("allocate new root: %w", err)
+		return 0, fmt.Errorf("allocate root: %w", err)
 	}
-	newRootPage := bt.pager.GetPage(newRootID)
-	initInternalNode(newRootPage, true)
-	newNa := newNodeAccessor(newRootPage)
+	newPage := bt.pager.GetPage(newRootID)
+	initInternalNode(newPage, true)
+	newNa := newNodeAccessor(newPage)
 	newNa.setFirstChild(leftPageID)
 	newNa.setInternalEntries(leftPageID, []internalEntry{{key: key, childPageID: rightPageID}})
 	newNa.page.SetDirty(true)
@@ -602,13 +585,11 @@ func (bt *BTree) createNewRoot(leftPageID uint32, key int, rightPageID uint32) (
 	leftPage := bt.pager.GetPage(leftPageID)
 	leftNa := newNodeAccessor(leftPage)
 	leftNa.setParent(newRootID)
-	leftNa.setIsRoot(false)
 	leftPage.SetDirty(true)
 
 	rightPage := bt.pager.GetPage(rightPageID)
 	rightNa := newNodeAccessor(rightPage)
 	rightNa.setParent(newRootID)
-	rightNa.setIsRoot(false)
 	rightPage.SetDirty(true)
 
 	if err := bt.pager.Flush(newRootID); err != nil {
@@ -637,4 +618,19 @@ func (bt *BTree) updateParentPointers(firstChild uint32, entries []internalEntry
 		childPage.SetDirty(true)
 		bt.pager.Flush(cid)
 	}
+}
+
+// encodeIntKey 将 int 编码为 8 字节 BigEndian []byte，用于 BTree key
+func encodeIntKey(v int) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(v))
+	return b
+}
+
+// decodeIntKey 从 8 字节 BigEndian []byte 解码为 int
+func decodeIntKey(b []byte) int {
+	if len(b) != 8 {
+		return 0
+	}
+	return int(binary.BigEndian.Uint64(b))
 }

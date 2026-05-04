@@ -16,52 +16,44 @@ type TableManager struct {
 	tables map[string]*Table // 内存中的表定义
 }
 
-// NewTableManager 创建表管理器
+// NewTableManager 创建表管理器（自动从磁盘加载已有表定义）
 func NewTableManager(pager *Pager) *TableManager {
-	return &TableManager{
+	tm := &TableManager{
 		pager:  pager,
 		tables: make(map[string]*Table),
 	}
+	// 自动加载已有的表定义
+	_ = tm.LoadTables()
+	return tm
 }
 
-// CreateTable 创建新表（持久化表元数据 + 分配首数据页）
+// CreateTable 创建新表（持久化表元数据 + 创建 B+Tree 聚簇索引）
 func (tm *TableManager) CreateTable(table *Table) error {
 	if _, exists := tm.tables[table.Name]; exists {
 		return fmt.Errorf("table %s already exists", table.Name)
 	}
 
-	// 分配首数据页
-	firstPageID, err := tm.pager.Allocate()
-	if err != nil {
-		return fmt.Errorf("allocate first data page: %w", err)
-	}
-
-	// 初始化数据页
-	dataPage := tm.pager.GetPage(firstPageID)
-	dataPage.setHeaderType(PageTypeTableData)
-	setRecordCount(dataPage.data, 0)
-	setFreeOffset(dataPage.data, 32) // 记录区从 32 开始
-	setNextPageID(dataPage.data, 0)
-	setPrevPageID(dataPage.data, 0)
-	setFirstDataPage(dataPage.data, firstPageID)
-	dataPage.SetDirty(true)
+	// 创建 B+Tree 作为聚簇索引
+	bt := NewBTree(tm.pager)
+	table.RootPageID = bt.rootPageID
 
 	// 持久化表定义到页
-	if err := tm.persistTableMeta(table, firstPageID); err != nil {
+	if err := tm.persistTableMeta(table); err != nil {
 		return fmt.Errorf("persist table meta: %w", err)
 	}
 
 	tm.tables[table.Name] = table
-	return tm.pager.Flush(firstPageID)
+	return nil
 }
 
 // persistTableMeta 把表定义序列化存到系统区域
 // 方案：用 page 0 的 data 区存所有表定义的 JSON
-func (tm *TableManager) persistTableMeta(table *Table, firstDataPage uint32) error {
+func (tm *TableManager) persistTableMeta(table *Table) error {
 	meta := map[string]interface{}{
-		"name":          table.Name,
-		"columns":       table.Columns,
-		"firstDataPage": firstDataPage,
+		"name":       table.Name,
+		"columns":    table.Columns,
+		"rootPageID": table.RootPageID,
+		"nextRowID":  table.NextRowID,
 	}
 
 	// 读出现有表定义列表，追加
@@ -127,7 +119,7 @@ func (tm *TableManager) ListTables() []string {
 	return names
 }
 
-// LoadTables 从磁盘恢复所有表定义
+// LoadTables 从磁盘恢复所有表定义（含 B+Tree rootPageID）
 func (tm *TableManager) LoadTables() error {
 	metaPage := tm.pager.GetPage(0)
 	count := binary.LittleEndian.Uint32(metaPage.Data()[0:4])
@@ -149,16 +141,36 @@ func (tm *TableManager) LoadTables() error {
 		var columns []Column
 		json.Unmarshal(colsRaw, &columns)
 		
+		// 解析 rootPageID
+		var rootPageID uint32
+		switch v := m["rootPageID"].(type) {
+		case float64:
+			rootPageID = uint32(v)
+		case uint32:
+			rootPageID = v
+		}
+		
+		// 解析 nextRowID
+		var nextRowID int
+		switch v := m["nextRowID"].(type) {
+		case float64:
+			nextRowID = int(v)
+		case int:
+			nextRowID = v
+		}
+		
 		tm.tables[name] = &Table{
-			Name:    name,
-			Columns: columns,
+			Name:       name,
+			Columns:    columns,
+			RootPageID: rootPageID,
+			NextRowID:  nextRowID,
 		}
 	}
 	
 	return nil
 }
 
-// Insert 向表中插入一行（非事务，立即刷盘）
+// Insert 向表中插入一行（B+Tree 聚簇索引）
 func (tm *TableManager) Insert(tableName string, row *Row) error {
 	table, ok := tm.tables[tableName]
 	if !ok {
@@ -170,50 +182,70 @@ func (tm *TableManager) Insert(tableName string, row *Row) error {
 		return fmt.Errorf("serialize row: %w", err)
 	}
 
-	firstPageID := tm.getFirstDataPage(tableName)
-	if firstPageID == 0 {
-		return fmt.Errorf("table %s has no data page", tableName)
+	// 使用自增 _rowid 作为 B+Tree key
+	rowID := table.NextRowID
+	table.NextRowID++
+
+	bt := LoadBTree(tm.pager, table.RootPageID)
+	if err := bt.Insert(encodeIntKey(rowID), rowData); err != nil {
+		return fmt.Errorf("btree insert: %w", err)
+	}
+	// BTree 分裂可能导致根节点变化，需要同步
+	if bt.rootPageID != table.RootPageID {
+		table.RootPageID = bt.rootPageID
 	}
 
-	_, _, err = tm.insertIntoPageInternal(firstPageID, rowData, false)
-	return err
+	// 更新表元数据（nextRowID 和可能的 rootPageID 变化）
+	return tm.persistTableMeta(table)
 }
 
-// InsertTx 事务版插入，不刷盘，返回 (pageID, slotIdx, error)
-func (tm *TableManager) InsertTx(tableName string, row *Row) (uint32, int, error) {
+// InsertTx 事务版插入，返回 (rowID, error)
+func (tm *TableManager) InsertTx(tableName string, row *Row) (int, error) {
 	table, ok := tm.tables[tableName]
 	if !ok {
-		return 0, 0, fmt.Errorf("table %s not found", tableName)
+		return 0, fmt.Errorf("table %s not found", tableName)
 	}
 
 	rowData, err := table.SerializeRow(row)
 	if err != nil {
-		return 0, 0, fmt.Errorf("serialize row: %w", err)
+		return 0, fmt.Errorf("serialize row: %w", err)
 	}
 
-	firstPageID := tm.getFirstDataPage(tableName)
-	if firstPageID == 0 {
-		return 0, 0, fmt.Errorf("table %s has no data page", tableName)
+	rowID := table.NextRowID
+	table.NextRowID++
+
+	bt := LoadBTree(tm.pager, table.RootPageID)
+	if err := bt.Insert(encodeIntKey(rowID), rowData); err != nil {
+		return 0, fmt.Errorf("btree insert: %w", err)
+	}
+	// BTree 分裂可能导致根节点变化，需要同步
+	if bt.rootPageID != table.RootPageID {
+		table.RootPageID = bt.rootPageID
 	}
 
-	return tm.insertIntoPageInternal(firstPageID, rowData, true)
+	return rowID, tm.persistTableMeta(table)
 }
 
-// DeleteSlot 标记删除指定位置的行（slot directory offset 设为 0xFFFF）
+// DeleteSlot 标记删除指定位置的行（B+Tree 暂不支持物理删除，这里是兼容接口）
 func (tm *TableManager) DeleteSlot(tableName string, pageID uint32, slotIdx int) error {
-	page := tm.pager.GetPage(pageID)
-	page.Lock()
-	defer page.Unlock()
+	return fmt.Errorf("delete not supported with btree storage")
+}
 
-	recordCount := getRecordCount(page.data)
-	if slotIdx < 0 || slotIdx >= recordCount {
-		return fmt.Errorf("invalid slot index %d", slotIdx)
+// DeleteByRowID 按 RowID 删除
+func (tm *TableManager) DeleteByRowID(tableName string, rowID int) error {
+	table, ok := tm.tables[tableName]
+	if !ok {
+		return fmt.Errorf("table %s not found", tableName)
 	}
-
-	slotOffset := PageSize - (slotIdx+1)*2
-	binary.LittleEndian.PutUint16(page.data[slotOffset:slotOffset+2], 0xFFFF)
-	page.SetDirty(true)
-	return nil
+	bt := LoadBTree(tm.pager, table.RootPageID)
+	if err := bt.Delete(encodeIntKey(rowID)); err != nil {
+		return fmt.Errorf("btree delete: %w", err)
+	}
+	// BTree 合并可能导致根节点变化（简化版暂不合并，但保留检查）
+	if bt.rootPageID != table.RootPageID {
+		table.RootPageID = bt.rootPageID
+	}
+	return tm.persistTableMeta(table)
 }
 
 // GetPager 返回底层 Pager
@@ -305,23 +337,20 @@ func (tm *TableManager) SelectAll(tableName string) ([]*Row, error) {
 		return nil, fmt.Errorf("table %s not found", tableName)
 	}
 
-	firstPageID := tm.getFirstDataPage(tableName)
-	if firstPageID == 0 {
-		return nil, nil
+	bt := LoadBTree(tm.pager, table.RootPageID)
+	pairs, err := bt.RangeScan(encodeIntKey(0), encodeIntKey(table.NextRowID))
+	if err != nil {
+		return nil, fmt.Errorf("btree scan: %w", err)
 	}
 
 	var rows []*Row
-	pageID := firstPageID
-	for pageID != 0 {
-		page := tm.pager.GetPage(pageID)
-		pageRows, err := tm.readRowsFromPage(page, table)
+	for _, pair := range pairs {
+		row, err := table.DeserializeRow(pair.Value)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("deserialize row %d: %w", pair.Key, err)
 		}
-		rows = append(rows, pageRows...)
-		pageID = getNextPageID(page.data)
+		rows = append(rows, row)
 	}
-	
 	return rows, nil
 }
 

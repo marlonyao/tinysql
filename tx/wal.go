@@ -25,8 +25,7 @@ type WALRecord struct {
 	TXID      uint64
 	Type      WALType
 	TableName string
-	PageID    uint32
-	SlotIdx   uint16
+	RowID     int    // B+Tree 逻辑 rowid（替代 PageID+SlotIdx）
 	Before    []byte // UNDO 用
 	After     []byte // REDO 用
 }
@@ -93,7 +92,7 @@ func (w *WAL) Write(r *WALRecord) error {
 
 	// 计算长度
 	tableNameBytes := []byte(r.TableName)
-	length := 8 + 1 + 2 + len(tableNameBytes) + 4 + 2 + 4 + len(r.Before) + 4 + len(r.After)
+	length := 8 + 1 + 2 + len(tableNameBytes) + 8 + 4 + len(r.Before) + 4 + len(r.After)
 
 	buf := make([]byte, 4+length)
 	offset := 0
@@ -112,12 +111,9 @@ func (w *WAL) Write(r *WALRecord) error {
 	offset += 2
 	copy(buf[offset:], tableNameBytes)
 	offset += len(tableNameBytes)
-	// PageID
-	binary.LittleEndian.PutUint32(buf[offset:offset+4], r.PageID)
-	offset += 4
-	// SlotIdx
-	binary.LittleEndian.PutUint16(buf[offset:offset+2], r.SlotIdx)
-	offset += 2
+	// RowID (int64)
+	binary.LittleEndian.PutUint64(buf[offset:offset+8], uint64(r.RowID))
+	offset += 8
 	// Before
 	binary.LittleEndian.PutUint32(buf[offset:offset+4], uint32(len(r.Before)))
 	offset += 4
@@ -199,10 +195,8 @@ func parseRecord(data []byte) *WALRecord {
 	r.TableName = string(data[offset : offset+int(tableLen)])
 	offset += int(tableLen)
 
-	r.PageID = binary.LittleEndian.Uint32(data[offset : offset+4])
-	offset += 4
-	r.SlotIdx = binary.LittleEndian.Uint16(data[offset : offset+2])
-	offset += 2
+	r.RowID = int(binary.LittleEndian.Uint64(data[offset : offset+8]))
+	offset += 8
 
 	beforeLen := binary.LittleEndian.Uint32(data[offset : offset+4])
 	offset += 4

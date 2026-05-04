@@ -39,8 +39,10 @@ type Column struct {
 
 // Table 表元数据
 type Table struct {
-	Name    string
-	Columns []Column
+	Name       string
+	Columns    []Column
+	RootPageID uint32 // B+Tree 聚簇索引根节点页ID
+	NextRowID  int    // 自增 _rowid 计数器
 }
 
 // Row 一行数据
@@ -158,7 +160,7 @@ func (t *Table) SerializeRow(row *Row) ([]byte, error) {
 func (t *Table) DeserializeRow(data []byte) (*Row, error) {
 	nullBitmapSize := (len(t.Columns) + 7) / 8
 	if len(data) < nullBitmapSize {
-		return nil, fmt.Errorf("data too short for null bitmap")
+		return nil, fmt.Errorf("data too short for null bitmap: got %d bytes, need %d", len(data), nullBitmapSize)
 	}
 
 	row := &Row{Values: make([]interface{}, len(t.Columns))}

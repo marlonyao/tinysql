@@ -116,7 +116,7 @@ func (txm *TransactionManager) Rollback(tx *Transaction) error {
 		}
 		if r.Type == WALInsert {
 			// UNDO INSERT = DELETE
-			if err := tx.tm.DeleteSlot(r.TableName, r.PageID, int(r.SlotIdx)); err != nil {
+			if err := tx.tm.DeleteByRowID(r.TableName, r.RowID); err != nil {
 				return fmt.Errorf("undo insert: %w", err)
 			}
 		}
@@ -174,7 +174,7 @@ func (txm *TransactionManager) Recover() error {
 		for i := len(recs) - 1; i >= 0; i-- {
 			r := recs[i]
 			if r.Type == WALInsert {
-				if err := txm.tm.DeleteSlot(r.TableName, r.PageID, int(r.SlotIdx)); err != nil {
+				if err := txm.tm.DeleteByRowID(r.TableName, r.RowID); err != nil {
 					return fmt.Errorf("recover undo insert tx=%d: %w", txID, err)
 				}
 			}
@@ -201,7 +201,7 @@ func (tx *Transaction) Insert(tableName string, row *storage.Row) error {
 		return fmt.Errorf("transaction not active")
 	}
 
-	pageID, slotIdx, err := tx.tm.InsertTx(tableName, row)
+	rowID, err := tx.tm.InsertTx(tableName, row)
 	if err != nil {
 		return err
 	}
@@ -215,15 +215,13 @@ func (tx *Transaction) Insert(tableName string, row *storage.Row) error {
 		TXID:      tx.ID,
 		Type:      WALInsert,
 		TableName: tableName,
-		PageID:    pageID,
-		SlotIdx:   uint16(slotIdx),
+		RowID:     rowID,
 		Before:    nil,      // INSERT 没有 BeforeImage
 		After:     rowData,  // AfterImage 用于 REDO
 	}); err != nil {
 		return fmt.Errorf("write wal: %w", err)
 	}
 
-	tx.dirtyPages[pageID] = true
 	return nil
 }
 

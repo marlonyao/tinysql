@@ -177,15 +177,27 @@ func TestTableManagerMultiPage(t *testing.T) {
 		}
 	}
 
-	// 验证使用了多页
-	firstPage := tm.getFirstDataPage("numbers")
-	if firstPage == 0 {
-		t.Fatalf("no data page")
+	// 验证使用了多页（BTree 方案：检查叶子节点数量 > 1）
+	tbl, _ := tm.GetTable("numbers")
+	bt := LoadBTree(pager, tbl.RootPageID)
+	pageID := bt.rootPageID
+	for {
+		page := pager.GetPage(pageID)
+		na := newNodeAccessor(page)
+		if na.nodeType() == NodeTypeLeaf {
+			break
+		}
+		pageID = na.firstChild()
 	}
-	page := pager.GetPage(firstPage)
-	nextPageID := getNextPageID(page.data)
-	if nextPageID == 0 {
-		t.Fatalf("expected multiple pages, got single page")
+	leafCount := 0
+	for pageID != 0 {
+		page := pager.GetPage(pageID)
+		na := newNodeAccessor(page)
+		pageID = na.rightSibling()
+		leafCount++
+	}
+	if leafCount < 2 {
+		t.Fatalf("expected multiple leaf pages, got %d", leafCount)
 	}
 }
 
