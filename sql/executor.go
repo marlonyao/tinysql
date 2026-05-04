@@ -6,15 +6,24 @@ import (
 	"strings"
 
 	"tinysql/storage"
+	"tinysql/tx"
 )
 
-// Executor SQL 执行器
+// Executor SQL 执行器（支持事务上下文）
 type Executor struct {
-	tm *storage.TableManager
+	tm        *storage.TableManager
+	txm       *tx.TransactionManager
+	currentTx *tx.Transaction // 当前活跃事务（如果有）
 }
 
+// NewExecutor 创建执行器（无事务支持）
 func NewExecutor(tm *storage.TableManager) *Executor {
 	return &Executor{tm: tm}
+}
+
+// NewExecutorWithTx 创建支持事务的执行器
+func NewExecutorWithTx(tm *storage.TableManager, txm *tx.TransactionManager) *Executor {
+	return &Executor{tm: tm, txm: txm}
 }
 
 // Execute 执行 SQL 语句
@@ -26,6 +35,12 @@ func (e *Executor) Execute(stmt Statement) (Result, error) {
 		return e.executeInsert(s)
 	case *SelectStmt:
 		return e.executeSelect(s)
+	case *TxBeginStmt:
+		return e.executeBegin()
+	case *TxCommitStmt:
+		return e.executeCommit()
+	case *TxRollbackStmt:
+		return e.executeRollback()
 	default:
 		return nil, fmt.Errorf("unsupported statement type")
 	}
@@ -51,6 +66,56 @@ type SelectResult struct {
 	Rows    [][]interface{}
 }
 func (r *SelectResult) resultNode() {}
+
+type TxResult struct {
+	Message string
+}
+func (r *TxResult) resultNode() {}
+
+// === 事务执行 ===
+
+func (e *Executor) executeBegin() (Result, error) {
+	if e.txm == nil {
+		return nil, fmt.Errorf("transaction manager not available")
+	}
+	if e.currentTx != nil {
+		return nil, fmt.Errorf("transaction already in progress")
+	}
+	tx, err := e.txm.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	e.currentTx = tx
+	return &TxResult{Message: "Transaction started"}, nil
+}
+
+func (e *Executor) executeCommit() (Result, error) {
+	if e.txm == nil {
+		return nil, fmt.Errorf("transaction manager not available")
+	}
+	if e.currentTx == nil {
+		return nil, fmt.Errorf("no active transaction")
+	}
+	if err := e.txm.Commit(e.currentTx); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	e.currentTx = nil
+	return &TxResult{Message: "Transaction committed"}, nil
+}
+
+func (e *Executor) executeRollback() (Result, error) {
+	if e.txm == nil {
+		return nil, fmt.Errorf("transaction manager not available")
+	}
+	if e.currentTx == nil {
+		return nil, fmt.Errorf("no active transaction")
+	}
+	if err := e.txm.Rollback(e.currentTx); err != nil {
+		return nil, fmt.Errorf("rollback: %w", err)
+	}
+	e.currentTx = nil
+	return &TxResult{Message: "Transaction rolled back"}, nil
+}
 
 // === 执行 CREATE TABLE ===
 
@@ -143,8 +208,15 @@ func (e *Executor) executeInsert(stmt *InsertStmt) (Result, error) {
 		row.Values[colIdx] = val
 	}
 
-	if err := e.tm.Insert(stmt.TableName, row); err != nil {
-		return nil, err
+	// 事务路径 vs 非事务路径
+	if e.currentTx != nil {
+		if err := e.currentTx.Insert(stmt.TableName, row); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := e.tm.Insert(stmt.TableName, row); err != nil {
+			return nil, err
+		}
 	}
 
 	return &InsertResult{RowsAffected: 1}, nil
@@ -207,163 +279,153 @@ func (e *Executor) executeSelect(stmt *SelectStmt) (Result, error) {
 		return nil, fmt.Errorf("table %s not found", stmt.TableName)
 	}
 
-	// 读取所有行
+	// 全表扫描
 	rows, err := e.tm.SelectAll(stmt.TableName)
 	if err != nil {
 		return nil, err
 	}
 
-	// 应用 WHERE 过滤
-	var filtered []*storage.Row
-	for _, row := range rows {
-		if stmt.Where == nil || evalWhere(stmt.Where, row, table) {
-			filtered = append(filtered, row)
+	// WHERE 过滤
+	if stmt.Where != nil {
+		var filtered []*storage.Row
+		for _, row := range rows {
+			match, err := evalWhere(stmt.Where, row, table.Columns)
+			if err != nil {
+				return nil, err
+			}
+			if match {
+				filtered = append(filtered, row)
+			}
 		}
+		rows = filtered
 	}
 
-	// 确定返回列
-	var colNames []string
+	// 列选择
+	var columns []string
+	var colIndices []int
 	if len(stmt.Columns) == 1 && stmt.Columns[0] == "*" {
-		for _, col := range table.Columns {
-			colNames = append(colNames, col.Name)
+		for i, col := range table.Columns {
+			columns = append(columns, col.Name)
+			colIndices = append(colIndices, i)
 		}
 	} else {
-		colNames = stmt.Columns
-	}
-
-	// 构建结果
-	var result [][]interface{}
-	for _, row := range filtered {
-		var rowVals []interface{}
-		for _, colName := range colNames {
-			colIdx := -1
-			for j, col := range table.Columns {
+		for _, colName := range stmt.Columns {
+			found := false
+			for i, col := range table.Columns {
 				if strings.EqualFold(col.Name, colName) {
-					colIdx = j
+					columns = append(columns, col.Name)
+					colIndices = append(colIndices, i)
+					found = true
 					break
 				}
 			}
-			if colIdx == -1 {
-				return nil, fmt.Errorf("column %s not found", colName)
+			if !found {
+				return nil, fmt.Errorf("column %s not found in table %s", colName, stmt.TableName)
 			}
-			rowVals = append(rowVals, row.Values[colIdx])
 		}
-		result = append(result, rowVals)
 	}
 
-	return &SelectResult{Columns: colNames, Rows: result}, nil
+	// 构建结果
+	var resultRows [][]interface{}
+	for _, row := range rows {
+		var vals []interface{}
+		for _, idx := range colIndices {
+			vals = append(vals, row.Values[idx])
+		}
+		resultRows = append(resultRows, vals)
+	}
+
+	return &SelectResult{
+		Columns: columns,
+		Rows:    resultRows,
+	}, nil
 }
 
-// evalWhere 计算 WHERE 条件
-func evalWhere(expr Expr, row *storage.Row, table *storage.Table) bool {
+func evalWhere(expr Expr, row *storage.Row, columns []storage.Column) (bool, error) {
 	switch e := expr.(type) {
 	case *BinaryExpr:
-		left := evalWhereExpr(e.Left, row, table)
-		right := evalWhereExpr(e.Right, row, table)
-
-		switch e.Op {
-		case "AND":
-			return left != nil && right != nil && toBool(left) && toBool(right)
-		case "OR":
-			return left != nil && toBool(left) || right != nil && toBool(right)
-		case "=":
-			return compareEqual(left, right)
-		case "<>":
-			return !compareEqual(left, right)
-		case "<":
-			return compareLess(left, right)
-		case ">":
-			return compareLess(right, left)
-		case "<=":
-			return compareEqual(left, right) || compareLess(left, right)
-		case ">=":
-			return compareEqual(left, right) || compareLess(right, left)
+		left, err := evalExprForWhere(e.Left, row, columns)
+		if err != nil {
+			return false, err
 		}
+		right, err := evalExprForWhere(e.Right, row, columns)
+		if err != nil {
+			return false, err
+		}
+		switch e.Op {
+		case "=":
+			return fmt.Sprintf("%v", left) == fmt.Sprintf("%v", right), nil
+		case "<>":
+			return fmt.Sprintf("%v", left) != fmt.Sprintf("%v", right), nil
+		case "<":
+			return compareValues(left, right) < 0, nil
+		case ">":
+			return compareValues(left, right) > 0, nil
+		case "<=":
+			return compareValues(left, right) <= 0, nil
+		case ">=":
+			return compareValues(left, right) >= 0, nil
+		case "AND":
+			return left.(bool) && right.(bool), nil
+		case "OR":
+			return left.(bool) || right.(bool), nil
+		default:
+			return false, fmt.Errorf("unknown operator: %s", e.Op)
+		}
+	case *Literal:
+		return e.Value.(bool), nil
+	default:
+		return false, fmt.Errorf("unsupported WHERE expression")
 	}
-	return false
 }
 
-func evalWhereExpr(expr Expr, row *storage.Row, table *storage.Table) interface{} {
+func evalExprForWhere(expr Expr, row *storage.Row, columns []storage.Column) (interface{}, error) {
 	switch e := expr.(type) {
 	case *Identifier:
-		for i, col := range table.Columns {
+		for i, col := range columns {
 			if strings.EqualFold(col.Name, e.Name) {
-				return row.Values[i]
+				return row.Values[i], nil
 			}
 		}
-		return nil
+		return nil, fmt.Errorf("column %s not found", e.Name)
 	case *Literal:
-		return e.Value
+		return e.Value, nil
+	case *BinaryExpr:
+		return evalWhere(e, row, columns)
+	default:
+		return nil, fmt.Errorf("unsupported expression in WHERE")
 	}
-	return nil
 }
 
-func toBool(v interface{}) bool {
+func compareValues(a, b interface{}) int {
+	// 尝试数值比较
+	ia, aok := toInt64(a)
+	ib, bok := toInt64(b)
+	if aok && bok {
+		if ia < ib { return -1 }
+		if ia > ib { return 1 }
+		return 0
+	}
+	// 回退到字符串比较
+	sa := fmt.Sprintf("%v", a)
+	sb := fmt.Sprintf("%v", b)
+	if sa < sb { return -1 }
+	if sa > sb { return 1 }
+	return 0
+}
+
+func toInt64(v interface{}) (int64, bool) {
 	switch val := v.(type) {
-	case bool:
-		return val
 	case int:
-		return val != 0
-	case string:
-		return val != ""
-	default:
-		return v != nil
-	}
-}
-
-func compareEqual(a, b interface{}) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-
-	// 统一类型比较
-	a = normalize(a)
-	b = normalize(b)
-
-	switch va := a.(type) {
-	case int:
-		vb, ok := b.(int)
-		return ok && va == vb
-	case string:
-		vb, ok := b.(string)
-		return ok && va == vb
-	case bool:
-		vb, ok := b.(bool)
-		return ok && va == vb
-	default:
-		return false
-	}
-}
-
-func compareLess(a, b interface{}) bool {
-	if a == nil || b == nil {
-		return false
-	}
-
-	a = normalize(a)
-	b = normalize(b)
-
-	switch va := a.(type) {
-	case int:
-		vb, ok := b.(int)
-		return ok && va < vb
-	case string:
-		vb, ok := b.(string)
-		return ok && va < vb
-	default:
-		return false
-	}
-}
-
-func normalize(v interface{}) interface{} {
-	switch val := v.(type) {
-	case float64:
-		return int(val)
+		return int64(val), true
 	case int32:
-		return int(val)
+		return int64(val), true
 	case int64:
-		return int(val)
+		return val, true
+	case string:
+		i, err := strconv.ParseInt(val, 10, 64)
+		return i, err == nil
 	default:
-		return v
+		return 0, false
 	}
 }

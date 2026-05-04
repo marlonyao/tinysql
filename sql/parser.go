@@ -37,6 +37,16 @@ type SelectStmt struct {
 
 func (s *SelectStmt) stmtNode() {}
 
+// 事务语句
+type TxBeginStmt struct{}
+func (s *TxBeginStmt) stmtNode() {}
+
+type TxCommitStmt struct{}
+func (s *TxCommitStmt) stmtNode() {}
+
+type TxRollbackStmt struct{}
+func (s *TxRollbackStmt) stmtNode() {}
+
 type ColumnDef struct {
 	Name     string
 	Type     string // "INT", "VARCHAR", "BOOL"
@@ -101,6 +111,7 @@ var keywords = map[string]struct{}{
 	"OR": {}, "NOT": {}, "NULL": {}, "INT": {},
 	"VARCHAR": {}, "TEXT": {}, "BOOL": {}, "VALUES": {}, "TRUE": {},
 	"FALSE": {}, "PRIMARY": {}, "KEY": {},
+	"BEGIN": {}, "COMMIT": {}, "ROLLBACK": {},
 }
 
 func tokenize(input string) ([]Token, error) {
@@ -269,6 +280,12 @@ func (p *Parser) Parse() (Statement, error) {
 		return p.parseInsert()
 	case "SELECT":
 		return p.parseSelect()
+	case "BEGIN":
+		return p.parseBegin()
+	case "COMMIT":
+		return p.parseCommit()
+	case "ROLLBACK":
+		return p.parseRollback()
 	default:
 		return nil, fmt.Errorf("unsupported statement: %s", tok.Value)
 	}
@@ -481,6 +498,21 @@ func (p *Parser) parsePrimaryExpr() (Expr, error) {
 	default:
 		return nil, fmt.Errorf("unexpected token in expression: %s", tok.Value)
 	}
+}
+
+func (p *Parser) parseBegin() (*TxBeginStmt, error) {
+	p.advance() // BEGIN
+	return &TxBeginStmt{}, nil
+}
+
+func (p *Parser) parseCommit() (*TxCommitStmt, error) {
+	p.advance() // COMMIT
+	return &TxCommitStmt{}, nil
+}
+
+func (p *Parser) parseRollback() (*TxRollbackStmt, error) {
+	p.advance() // ROLLBACK
+	return &TxRollbackStmt{}, nil
 }
 
 // ParseSQL 便捷函数

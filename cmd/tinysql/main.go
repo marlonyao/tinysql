@@ -18,8 +18,7 @@ func main() {
 	}
 
 	dbPath := os.Args[1]
-	
-	// 打开或创建数据库
+
 	pager, err := storage.NewPager(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
@@ -33,7 +32,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 初始化 WAL 和事务管理器
 	txm, err := tx.NewTransactionManager(tm, dbPath+".wal")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error initializing transaction manager: %v\n", err)
@@ -41,13 +39,12 @@ func main() {
 	}
 	defer txm.Close()
 
-	// 崩溃恢复
 	if err := txm.Recover(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error recovering: %v\n", err)
 		os.Exit(1)
 	}
 
-	executor := sql.NewExecutor(tm)
+	executor := sql.NewExecutorWithTx(tm, txm)
 
 	fmt.Println("TinySQL v0.1")
 	fmt.Println("Type .help for usage hints. Type .quit to exit.")
@@ -65,13 +62,11 @@ func main() {
 			continue
 		}
 
-		// 元命令
 		if strings.HasPrefix(line, ".") {
 			handleMetaCommand(line, tm)
 			continue
 		}
 
-		// 累积多行 SQL（简单处理：以 ; 结尾）
 		sqlText := line
 		for !strings.HasSuffix(sqlText, ";") {
 			fmt.Print("   ...> ")
@@ -81,7 +76,6 @@ func main() {
 			sqlText += " " + strings.TrimSpace(scanner.Text())
 		}
 
-		// 解析并执行 SQL
 		stmt, err := sql.ParseSQL(sqlText)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
@@ -141,20 +135,19 @@ func printResult(result sql.Result) {
 		fmt.Println(r.Message)
 	case *sql.InsertResult:
 		fmt.Printf("Affected %d row(s)\n", r.RowsAffected)
+	case *sql.TxResult:
+		fmt.Println(r.Message)
 	case *sql.SelectResult:
 		if len(r.Rows) == 0 {
 			fmt.Println("(no rows)")
 			return
 		}
-		// 打印表头
 		fmt.Println(strings.Join(r.Columns, " | "))
-		// 打印分隔线
 		var sep []string
 		for _, col := range r.Columns {
 			sep = append(sep, strings.Repeat("-", len(col)))
 		}
 		fmt.Println(strings.Join(sep, "-+-"))
-		// 打印数据
 		for _, row := range r.Rows {
 			var strs []string
 			for _, val := range row {
