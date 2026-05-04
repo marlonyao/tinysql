@@ -6,6 +6,8 @@ import (
 	"strings"
 )
 
+// === 字符串字面量支持 ===
+
 // === AST 节点 ===
 
 type Statement interface {
@@ -135,6 +137,22 @@ func tokenize(input string) ([]Token, error) {
 			}
 			tokens = append(tokens, Token{Type: TokenNumber, Value: input[i:j]})
 			i = j
+			continue
+		}
+
+		// 字符串: '...'
+		if c == '\'' {
+			j := i + 1
+			for j < len(input) && input[j] != '\'' {
+				j++
+			}
+			if j >= len(input) {
+				return nil, fmt.Errorf("unterminated string at %d", i)
+			}
+			// 不包含两边的引号
+			val := input[i+1 : j]
+			tokens = append(tokens, Token{Type: TokenString, Value: val})
+			i = j + 1
 			continue
 		}
 
