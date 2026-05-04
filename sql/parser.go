@@ -312,16 +312,19 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 	tok, _ := p.expect(TokenIdentifier)
 	stmt := &InsertStmt{TableName: tok.Value}
 
-	p.expect(TokenSymbol, "(")
-	for {
-		colTok, _ := p.expect(TokenIdentifier)
-		stmt.Columns = append(stmt.Columns, colTok.Value)
-		if p.peek().Value == ")" {
-			break
+	// 可选的列名列表
+	if p.peek().Value == "(" {
+		p.expect(TokenSymbol, "(")
+		for {
+			colTok, _ := p.expect(TokenIdentifier)
+			stmt.Columns = append(stmt.Columns, colTok.Value)
+			if p.peek().Value == ")" {
+				break
+			}
+			p.expect(TokenSymbol, ",")
 		}
-		p.expect(TokenSymbol, ",")
+		p.expect(TokenSymbol, ")")
 	}
-	p.expect(TokenSymbol, ")")
 
 	p.expect(TokenKeyword, "VALUES")
 	p.expect(TokenSymbol, "(")

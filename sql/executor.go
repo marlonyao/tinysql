@@ -2,6 +2,7 @@ package sql
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"tinysql/storage"
@@ -109,7 +110,19 @@ func (e *Executor) executeInsert(stmt *InsertStmt) (Result, error) {
 		row.Values[i] = nil
 	}
 
-	for i, colName := range stmt.Columns {
+	// 未指定列名时，默认按表列顺序
+	columns := stmt.Columns
+	if len(columns) == 0 {
+		for _, col := range table.Columns {
+			columns = append(columns, col.Name)
+		}
+	}
+
+	if len(stmt.Values) != len(columns) {
+		return nil, fmt.Errorf("value count mismatch: expected %d, got %d", len(columns), len(stmt.Values))
+	}
+
+	for i, colName := range columns {
 		// 找到列索引
 		colIdx := -1
 		for j, col := range table.Columns {
@@ -157,8 +170,11 @@ func convertValue(val interface{}, colType storage.ColumnType) (interface{}, err
 		case int:
 			return v, nil
 		case string:
-			// 尝试解析
-			return nil, fmt.Errorf("cannot convert string to int")
+			i, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, fmt.Errorf("cannot convert string '%s' to int: %w", v, err)
+			}
+			return i, nil
 		default:
 			return nil, fmt.Errorf("cannot convert %T to int", val)
 		}
