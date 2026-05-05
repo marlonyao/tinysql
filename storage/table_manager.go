@@ -209,7 +209,7 @@ func (tm *TableManager) Insert(tableName string, row *Row) error {
 	for i := range table.Indexes {
 		idx := &table.Indexes[i]
 		idxBT := LoadBTree(tm.pager, idx.RootPageID)
-		key, err := tm.buildIndexKey(table, *idx, row, rowID)
+		key, err := tm.BuildIndexKey(table, *idx, row, rowID)
 		if err != nil {
 			return fmt.Errorf("build index key for %s: %w", idx.Name, err)
 		}
@@ -253,7 +253,7 @@ func (tm *TableManager) InsertTx(tableName string, row *Row) (int, error) {
 	for i := range table.Indexes {
 		idx := &table.Indexes[i]
 		idxBT := LoadBTree(tm.pager, idx.RootPageID)
-		key, err := tm.buildIndexKey(table, *idx, row, rowID)
+		key, err := tm.BuildIndexKey(table, *idx, row, rowID)
 		if err != nil {
 			return 0, fmt.Errorf("build index key for %s: %w", idx.Name, err)
 		}
@@ -298,7 +298,7 @@ func (tm *TableManager) DeleteByRowID(tableName string, rowID int) error {
 	for i := range table.Indexes {
 		idx := &table.Indexes[i]
 		idxBT := LoadBTree(tm.pager, idx.RootPageID)
-		key, err := tm.buildIndexKey(table, *idx, row, rowID)
+		key, err := tm.BuildIndexKey(table, *idx, row, rowID)
 		if err != nil {
 			return fmt.Errorf("build index key for %s: %w", idx.Name, err)
 		}
@@ -388,7 +388,7 @@ func (tm *TableManager) CreateIndex(tableName, indexName string, columns []strin
 
 	for i, row := range rows {
 		rowID := rowIDs[i]
-		key, err := tm.buildIndexKey(table, idx, row, rowID)
+		key, err := tm.BuildIndexKey(table, idx, row, rowID)
 		if err != nil {
 			return err
 		}
@@ -403,9 +403,9 @@ func (tm *TableManager) CreateIndex(tableName, indexName string, columns []strin
 	return tm.persistTableMeta(table)
 }
 
-// buildIndexKey 根据索引列从行数据构建索引 key
+// BuildIndexKey 根据索引列从行数据构建索引 key
 // 格式: [col1_value][col2_value]...[rowid] — 确保唯一性
-func (tm *TableManager) buildIndexKey(table *Table, idx Index, row *Row, rowID int) ([]byte, error) {
+func (tm *TableManager) BuildIndexKey(table *Table, idx Index, row *Row, rowID int) ([]byte, error) {
 	var buf []byte
 	for _, colName := range idx.Columns {
 		colIdx := -1

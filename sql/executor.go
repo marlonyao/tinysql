@@ -540,16 +540,32 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) (Result, error) {
 		setValues[colName] = val
 	}
 
-	// 逐行更新：聚簇索引 key (rowID) 不变，直接覆盖 value
+	// 逐行更新：先删旧索引，再更新聚簇索引，再插新索引
 	updated := 0
+	pager := e.tm.GetPager()
 	for i, row := range toUpdateRows {
 		rowID := toUpdateIDs[i]
+
+		// 删除旧二级索引（需要旧行数据构建旧 key）
+		for j := range table.Indexes {
+			idx := &table.Indexes[j]
+			idxBT := storage.LoadBTree(pager, idx.RootPageID)
+			oldKey, err := e.tm.BuildIndexKey(table, *idx, row, rowID)
+			if err != nil {
+				return nil, fmt.Errorf("build old index key: %w", err)
+			}
+			if err := idxBT.Delete(oldKey); err != nil {
+				return nil, fmt.Errorf("delete old index key: %w", err)
+			}
+			if idxBT.RootPageID() != idx.RootPageID {
+				idx.RootPageID = idxBT.RootPageID()
+			}
+		}
 
 		// 应用 SET
 		for colName, val := range setValues {
 			for j, col := range table.Columns {
 				if strings.EqualFold(col.Name, colName) {
-					// 类型转换
 					converted, err := convertValue(val, col.Type)
 					if err != nil {
 						return nil, err
@@ -560,25 +576,38 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) (Result, error) {
 			}
 		}
 
-		// 重新序列化并覆盖 BTree 中的记录（相同 key = 更新）
+		// 重新序列化并覆盖聚簇索引
 		rowData, err := table.SerializeRow(row)
 		if err != nil {
 			return nil, fmt.Errorf("serialize row: %w", err)
 		}
-
-		bt := storage.LoadBTree(e.tm.GetPager(), table.RootPageID)
+		bt := storage.LoadBTree(pager, table.RootPageID)
 		if err := bt.Insert(storage.EncodeIntKey(rowID), rowData); err != nil {
 			return nil, fmt.Errorf("btree update: %w", err)
 		}
-		// BTree 根可能变化
 		if bt.RootPageID() != table.RootPageID {
 			table.RootPageID = bt.RootPageID()
+		}
+
+		// 插入新二级索引
+		for j := range table.Indexes {
+			idx := &table.Indexes[j]
+			idxBT := storage.LoadBTree(pager, idx.RootPageID)
+			newKey, err := e.tm.BuildIndexKey(table, *idx, row, rowID)
+			if err != nil {
+				return nil, fmt.Errorf("build new index key: %w", err)
+			}
+			if err := idxBT.Insert(newKey, storage.EncodeIntKey(rowID)); err != nil {
+				return nil, fmt.Errorf("insert new index key: %w", err)
+			}
+			if idxBT.RootPageID() != idx.RootPageID {
+				idx.RootPageID = idxBT.RootPageID()
+			}
 		}
 		updated++
 	}
 
 	if updated > 0 {
-		// 更新表元数据（可能 rootPageID 变了）
 		if err := e.tm.PersistTableMeta(table); err != nil {
 			return nil, err
 		}
