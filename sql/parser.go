@@ -76,6 +76,8 @@ type ColumnDef struct {
 	Name     string
 	Type     string // "INT", "VARCHAR", "BOOL"
 	Nullable bool
+	Primary  bool   // PRIMARY KEY 约束
+	Unique   bool   // UNIQUE 约束
 }
 
 // Expr 表达式接口
@@ -373,6 +375,20 @@ func (p *Parser) parseCreateTable() (*CreateTableStmt, error) {
 			col.Nullable = true
 		} else {
 			col.Nullable = true // 默认 nullable
+		}
+
+		// 可选的 PRIMARY KEY
+		if strings.EqualFold(p.peek().Value, "PRIMARY") {
+			p.advance()
+			p.expect(TokenKeyword, "KEY")
+			col.Primary = true
+			col.Nullable = false // 主键不允许 NULL
+		}
+
+		// 可选的 UNIQUE
+		if strings.EqualFold(p.peek().Value, "UNIQUE") {
+			p.advance()
+			col.Unique = true
 		}
 
 		stmt.Columns = append(stmt.Columns, col)

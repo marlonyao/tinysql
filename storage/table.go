@@ -35,6 +35,7 @@ type Column struct {
 	Length   uint16 // VARCHAR 长度
 	Nullable bool
 	Primary  bool
+	Unique   bool
 }
 
 // Index 二级索引定义

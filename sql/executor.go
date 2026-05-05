@@ -157,8 +157,11 @@ func (e *Executor) executeCreateTable(stmt *CreateTableStmt) (Result, error) {
 			return nil, err
 		}
 		columns[i] = storage.Column{
-			Name: col.Name,
-			Type: colType,
+			Name:     col.Name,
+			Type:     colType,
+			Nullable: col.Nullable,
+			Primary:  col.Primary,
+			Unique:   col.Unique,
 		}
 	}
 
@@ -169,6 +172,23 @@ func (e *Executor) executeCreateTable(stmt *CreateTableStmt) (Result, error) {
 
 	if err := e.tm.CreateTable(table); err != nil {
 		return nil, err
+	}
+
+	// 自动为 PRIMARY KEY / UNIQUE 列创建索引
+	for i, col := range columns {
+		if col.Primary || col.Unique {
+			idxName := fmt.Sprintf("idx_%s_%s", stmt.TableName, col.Name)
+			if col.Primary {
+				idxName = fmt.Sprintf("pk_%s", col.Name)
+			}
+			err := e.tm.CreateIndex(stmt.TableName, idxName, []string{col.Name}, col.Primary || col.Unique)
+			if err != nil {
+				return nil, fmt.Errorf("auto create index for %s: %w", col.Name, err)
+			}
+			// 同步回 table.Columns（CreateIndex 会修改 table.Indexes）
+			table.Columns[i].Primary = col.Primary
+			table.Columns[i].Unique = col.Unique
+		}
 	}
 
 	return &CreateTableResult{Message: fmt.Sprintf("Table %s created", stmt.TableName)}, nil

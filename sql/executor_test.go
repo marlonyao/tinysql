@@ -404,6 +404,81 @@ func MustParse(sql string) Statement {
 	return stmt
 }
 
+func TestExecutorCreateTableWithConstraints(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	pager, err := storage.NewPager(dbPath)
+	if err != nil {
+		t.Fatalf("NewPager: %v", err)
+	}
+	defer pager.Close()
+
+	tm := storage.NewTableManager(pager)
+	exec := NewExecutor(tm)
+
+	// 建表时声明主键和唯一约束
+	_, err = exec.Execute(MustParse("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(20), email VARCHAR(50) UNIQUE)"))
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// 检查表结构
+	table, ok := tm.GetTable("users")
+	if !ok {
+		t.Fatalf("table users not found")
+	}
+	if !table.Columns[0].Primary {
+		t.Fatalf("expected id to be PRIMARY KEY")
+	}
+	if !table.Columns[2].Unique {
+		t.Fatalf("expected email to be UNIQUE")
+	}
+
+	// 检查自动创建的索引
+	if len(table.Indexes) != 2 {
+		t.Fatalf("expected 2 auto indexes, got %d", len(table.Indexes))
+	}
+
+	// 插入数据
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"))
+	if err != nil {
+		t.Fatalf("insert 1: %v", err)
+	}
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (2, 'Bob', 'bob@example.com')"))
+	if err != nil {
+		t.Fatalf("insert 2: %v", err)
+	}
+
+	// 主键重复
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (1, 'Charlie', 'charlie@example.com')"))
+	if err == nil {
+		t.Fatalf("expected primary key conflict, got nil")
+	}
+
+	// 唯一约束重复
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (3, 'Dave', 'alice@example.com')"))
+	if err == nil {
+		t.Fatalf("expected unique constraint violation, got nil")
+	}
+
+	// 正常插入
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (3, 'Dave', 'dave@example.com')"))
+	if err != nil {
+		t.Fatalf("insert 3: %v", err)
+	}
+
+	// 查询验证
+	res, err := exec.Execute(MustParse("SELECT * FROM users"))
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	selectRes := res.(*SelectResult)
+	if len(selectRes.Rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(selectRes.Rows))
+	}
+}
+
 func TestExecutorIndexScan(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
