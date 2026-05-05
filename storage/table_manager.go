@@ -664,6 +664,101 @@ func (tm *TableManager) SelectAll(tableName string) ([]*Row, error) {
 	return rows, nil
 }
 
+// SelectByIndex 通过索引查找匹配的行（等值查询）
+func (tm *TableManager) SelectByIndex(tableName string, indexName string, values []interface{}) ([]*Row, []int, error) {
+	table, ok := tm.tables[tableName]
+	if !ok {
+		return nil, nil, fmt.Errorf("table %s not found", tableName)
+	}
+
+	// 找到索引
+	var idx Index
+	found := false
+	for _, i := range table.Indexes {
+		if i.Name == indexName {
+			idx = i
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, nil, fmt.Errorf("index %s not found", indexName)
+	}
+
+	// 校验 values 数量
+	if len(values) != len(idx.Columns) {
+		return nil, nil, fmt.Errorf("index %s expects %d values, got %d", indexName, len(idx.Columns), len(values))
+	}
+
+	// 构建索引 key
+	idxBT := LoadBTree(tm.pager, idx.RootPageID)
+
+	// 构建完整长度的临时 Row（BuildIndexKey 需要按 table.Columns 顺序访问）
+	 tmpRow := &Row{Values: make([]interface{}, len(table.Columns))}
+	 for i, colName := range idx.Columns {
+		 colIdx := -1
+		 for j, col := range table.Columns {
+			 if strings.EqualFold(col.Name, colName) {
+				 colIdx = j
+				 break
+			 }
+		 }
+		 if colIdx >= 0 && i < len(values) {
+			 tmpRow.Values[colIdx] = values[i]
+		 }
+	 }
+
+	// 对唯一索引：key = 纯列值，可以直接 Search
+	// 对非唯一索引：key = [列值][rowid]，需要用 RangeScan
+	if idx.Unique {
+		key, err := tm.BuildIndexKey(table, idx, tmpRow, 0)
+		if err != nil {
+			return nil, nil, fmt.Errorf("build index key: %w", err)
+		}
+		val, found, err := idxBT.Search(key)
+		if err != nil || !found {
+			return nil, nil, nil // 未找到
+		}
+		rowID := DecodeIntKey(val)
+		rowData, found, err := LoadBTree(tm.pager, table.RootPageID).Search(EncodeIntKey(rowID))
+		if err != nil || !found {
+			return nil, nil, fmt.Errorf("clustered index lookup failed for row %d", rowID)
+		}
+		r, err := table.DeserializeRow(rowData)
+		if err != nil {
+			return nil, nil, fmt.Errorf("deserialize row %d: %w", rowID, err)
+		}
+		return []*Row{r}, []int{rowID}, nil
+	}
+
+	// 非唯一索引：用 RangeScan 找 [values+minRowID, values+maxRowID] 范围内的所有条目
+	minKey, _ := tm.BuildIndexKey(table, idx, tmpRow, 0)
+	maxKey, _ := tm.BuildIndexKey(table, idx, tmpRow, table.NextRowID-1)
+
+	pairs, err := idxBT.RangeScan(minKey, maxKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("index range scan: %w", err)
+	}
+
+	var rows []*Row
+	var rowIDs []int
+	bt := LoadBTree(tm.pager, table.RootPageID)
+	for _, pair := range pairs {
+		rowID := DecodeIntKey(pair.Value)
+		rowData, found, err := bt.Search(EncodeIntKey(rowID))
+		if err != nil || !found {
+			continue // 跳过找不到的行
+		}
+		r, err := table.DeserializeRow(rowData)
+		if err != nil {
+			continue
+		}
+		rows = append(rows, r)
+		rowIDs = append(rowIDs, rowID)
+	}
+	return rows, rowIDs, nil
+}
+
 // readRowsFromPage 从单个页读取所有行（跳过已删除的 slot）
 func (tm *TableManager) readRowsFromPage(page *Page, table *Table) ([]*Row, error) {
 	recordCount := getRecordCount(page.data)

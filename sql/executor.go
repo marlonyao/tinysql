@@ -309,25 +309,45 @@ func (e *Executor) executeSelect(stmt *SelectStmt) (Result, error) {
 		return nil, fmt.Errorf("table %s not found", stmt.TableName)
 	}
 
-	// 全表扫描
-	rows, err := e.tm.SelectAll(stmt.TableName)
-	if err != nil {
-		return nil, err
+	var rows []*storage.Row
+	var rowIDs []int
+	var err error
+
+	// 尝试索引扫描：从 WHERE 中提取等值条件，找到匹配的索引
+	if stmt.Where != nil {
+		indexName, values := e.findBestIndex(table, stmt.Where)
+		if indexName != "" {
+			rows, rowIDs, err = e.tm.SelectByIndex(stmt.TableName, indexName, values)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// 无法走索引时全表扫描
+	if rows == nil {
+		rows, rowIDs, err = e.tm.SelectAllWithRowID(stmt.TableName)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// WHERE 过滤
 	if stmt.Where != nil {
 		var filtered []*storage.Row
-		for _, row := range rows {
+		var filteredIDs []int
+		for i, row := range rows {
 			match, err := evalWhere(stmt.Where, row, table.Columns)
 			if err != nil {
 				return nil, err
 			}
 			if match {
 				filtered = append(filtered, row)
+				filteredIDs = append(filteredIDs, rowIDs[i])
 			}
 		}
 		rows = filtered
+		rowIDs = filteredIDs
 	}
 
 	// 列选择
@@ -369,6 +389,66 @@ func (e *Executor) executeSelect(stmt *SelectStmt) (Result, error) {
 		Columns: columns,
 		Rows:    resultRows,
 	}, nil
+}
+
+// findBestIndex 从 WHERE 条件中提取等值条件，找到最匹配的索引
+// 返回 (索引名, 索引列的值列表)。未找到返回 ("", nil)
+func (e *Executor) findBestIndex(table *storage.Table, where Expr) (string, []interface{}) {
+	// 提取所有 column = literal 的等值条件
+	eqConds := make(map[string]interface{})
+	extractEqConditions(where, eqConds)
+	if len(eqConds) == 0 {
+		return "", nil
+	}
+
+	// 遍历所有索引，找最长前缀匹配
+	bestIdx := ""
+	bestValues := []interface{}{}
+	bestMatch := 0
+
+	for _, idx := range table.Indexes {
+		var values []interface{}
+		matched := 0
+		for _, col := range idx.Columns {
+			val, ok := eqConds[strings.ToLower(col)]
+			if !ok {
+				break
+			}
+			values = append(values, val)
+			matched++
+		}
+		if matched > bestMatch {
+			bestMatch = matched
+			bestIdx = idx.Name
+			bestValues = values
+		}
+	}
+
+	if bestMatch == 0 {
+		return "", nil
+	}
+	return bestIdx, bestValues
+}
+
+// extractEqConditions 从 WHERE 表达式中提取 column = literal 的等值条件
+func extractEqConditions(expr Expr, out map[string]interface{}) {
+	switch e := expr.(type) {
+	case *BinaryExpr:
+		if e.Op == "=" {
+			if id, ok := e.Left.(*Identifier); ok {
+				if lit, ok := e.Right.(*Literal); ok {
+					out[strings.ToLower(id.Name)] = lit.Value
+				}
+			} else if id, ok := e.Right.(*Identifier); ok {
+				if lit, ok := e.Left.(*Literal); ok {
+					out[strings.ToLower(id.Name)] = lit.Value
+				}
+			}
+		} else if e.Op == "AND" {
+			extractEqConditions(e.Left, out)
+			extractEqConditions(e.Right, out)
+		}
+	}
 }
 
 func evalWhere(expr Expr, row *storage.Row, columns []storage.Column) (bool, error) {

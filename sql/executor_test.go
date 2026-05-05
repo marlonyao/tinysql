@@ -404,6 +404,67 @@ func MustParse(sql string) Statement {
 	return stmt
 }
 
+func TestExecutorIndexScan(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	pager, err := storage.NewPager(dbPath)
+	if err != nil {
+		t.Fatalf("NewPager: %v", err)
+	}
+	defer pager.Close()
+
+	tm := storage.NewTableManager(pager)
+	exec := NewExecutor(tm)
+
+	_, err = exec.Execute(MustParse("CREATE TABLE users (id INT, name VARCHAR(20), age INT)"))
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (1, 'Alice', 25)"))
+	if err != nil {
+		t.Fatalf("insert 1: %v", err)
+	}
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (2, 'Bob', 30)"))
+	if err != nil {
+		t.Fatalf("insert 2: %v", err)
+	}
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (3, 'Charlie', 35)"))
+	if err != nil {
+		t.Fatalf("insert 3: %v", err)
+	}
+
+	// 创建索引
+	_, err = exec.Execute(MustParse("CREATE INDEX idx_name ON users (name)"))
+	if err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+
+	// 通过索引扫描查询
+	res, err := exec.Execute(MustParse("SELECT * FROM users WHERE name = 'Bob'"))
+	if err != nil {
+		t.Fatalf("select by index: %v", err)
+	}
+	selectRes := res.(*SelectResult)
+	if len(selectRes.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(selectRes.Rows))
+	}
+	if selectRes.Rows[0][1] != "Bob" {
+		t.Fatalf("expected Bob, got %v", selectRes.Rows[0][1])
+	}
+
+	// 复合条件：索引过滤 + WHERE 剩余条件
+	res, err = exec.Execute(MustParse("SELECT * FROM users WHERE name = 'Alice' AND age = 25"))
+	if err != nil {
+		t.Fatalf("select composite: %v", err)
+	}
+	selectRes = res.(*SelectResult)
+	if len(selectRes.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(selectRes.Rows))
+	}
+}
+
 func TestExecutorCreateUniqueIndex(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
