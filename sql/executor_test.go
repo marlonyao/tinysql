@@ -404,3 +404,117 @@ func MustParse(sql string) Statement {
 	return stmt
 }
 
+func TestExecutorCreateUniqueIndex(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	pager, err := storage.NewPager(dbPath)
+	if err != nil {
+		t.Fatalf("NewPager: %v", err)
+	}
+	defer pager.Close()
+
+	tm := storage.NewTableManager(pager)
+	exec := NewExecutor(tm)
+
+	_, err = exec.Execute(MustParse("CREATE TABLE users (id INT, name VARCHAR(20), email VARCHAR(50))"))
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"))
+	if err != nil {
+		t.Fatalf("insert 1: %v", err)
+	}
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (2, 'Bob', 'bob@example.com')"))
+	if err != nil {
+		t.Fatalf("insert 2: %v", err)
+	}
+
+	_, err = exec.Execute(MustParse("CREATE UNIQUE INDEX idx_email ON users (email)"))
+	if err != nil {
+		t.Fatalf("create unique index: %v", err)
+	}
+
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (3, 'Charlie', 'alice@example.com')"))
+	if err == nil {
+		t.Fatalf("expected unique constraint violation, got nil")
+	}
+	if err != nil && !contains(err.Error(), "unique constraint violation") {
+		t.Fatalf("expected unique constraint error, got: %v", err)
+	}
+
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (3, 'Charlie', 'charlie@example.com')"))
+	if err != nil {
+		t.Fatalf("insert 3: %v", err)
+	}
+
+	res, err := exec.Execute(MustParse("SELECT * FROM users"))
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	selectRes := res.(*SelectResult)
+	if len(selectRes.Rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(selectRes.Rows))
+	}
+}
+
+func TestExecutorUniqueIndexUpdateConflict(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	pager, err := storage.NewPager(dbPath)
+	if err != nil {
+		t.Fatalf("NewPager: %v", err)
+	}
+	defer pager.Close()
+
+	tm := storage.NewTableManager(pager)
+	exec := NewExecutor(tm)
+
+	_, err = exec.Execute(MustParse("CREATE TABLE users (id INT, name VARCHAR(20), email VARCHAR(50))"))
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"))
+	if err != nil {
+		t.Fatalf("insert 1: %v", err)
+	}
+	_, err = exec.Execute(MustParse("INSERT INTO users VALUES (2, 'Bob', 'bob@example.com')"))
+	if err != nil {
+		t.Fatalf("insert 2: %v", err)
+	}
+
+	_, err = exec.Execute(MustParse("CREATE UNIQUE INDEX idx_email ON users (email)"))
+	if err != nil {
+		t.Fatalf("create unique index: %v", err)
+	}
+
+	_, err = exec.Execute(MustParse("UPDATE users SET email = 'alice@example.com' WHERE name = 'Bob'"))
+	if err == nil {
+		t.Fatalf("expected unique constraint violation on update, got nil")
+	}
+	if err != nil && !contains(err.Error(), "unique constraint violation") {
+		t.Fatalf("expected unique constraint error, got: %v", err)
+	}
+
+	_, err = exec.Execute(MustParse("UPDATE users SET email = 'alice@example.com' WHERE name = 'Alice'"))
+	if err != nil {
+		t.Fatalf("update same value: %v", err)
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsInternal(s, substr))
+}
+
+func containsInternal(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+

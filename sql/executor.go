@@ -623,6 +623,11 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) (Result, error) {
 			if err != nil {
 				return nil, fmt.Errorf("build new index key: %w", err)
 			}
+			if idx.Unique {
+				if conflictRowID, conflict := e.tm.CheckUniqueConflict(idxBT, newKey, rowID); conflict {
+					return nil, fmt.Errorf("unique constraint violation on %s: row %d", idx.Name, conflictRowID)
+				}
+			}
 			if err := idxBT.Insert(newKey, storage.EncodeIntKey(rowID)); err != nil {
 				return nil, fmt.Errorf("insert new index key: %w", err)
 			}

@@ -199,6 +199,23 @@ func (tm *TableManager) Insert(tableName string, row *Row) error {
 
 	// 使用自增 _rowid 作为 B+Tree key
 	rowID := table.NextRowID
+
+	// 先检查所有唯一索引约束（避免聚簇索引插入后无法回滚）
+	for i := range table.Indexes {
+		idx := &table.Indexes[i]
+		if !idx.Unique {
+			continue
+		}
+		key, err := tm.BuildIndexKey(table, *idx, row, rowID)
+		if err != nil {
+			return fmt.Errorf("build index key for %s: %w", idx.Name, err)
+		}
+		idxBT := LoadBTree(tm.pager, idx.RootPageID)
+		if conflictRowID, conflict := tm.CheckUniqueConflict(idxBT, key, rowID); conflict {
+			return fmt.Errorf("unique constraint violation on %s: row %d", idx.Name, conflictRowID)
+		}
+	}
+
 	table.NextRowID++
 
 	bt := LoadBTree(tm.pager, table.RootPageID)
@@ -243,6 +260,23 @@ func (tm *TableManager) InsertTx(tableName string, row *Row) (int, error) {
 	}
 
 	rowID := table.NextRowID
+
+	// 先检查所有唯一索引约束
+	for i := range table.Indexes {
+		idx := &table.Indexes[i]
+		if !idx.Unique {
+			continue
+		}
+		key, err := tm.BuildIndexKey(table, *idx, row, rowID)
+		if err != nil {
+			return 0, fmt.Errorf("build index key for %s: %w", idx.Name, err)
+		}
+		idxBT := LoadBTree(tm.pager, idx.RootPageID)
+		if conflictRowID, conflict := tm.CheckUniqueConflict(idxBT, key, rowID); conflict {
+			return 0, fmt.Errorf("unique constraint violation on %s: row %d", idx.Name, conflictRowID)
+		}
+	}
+
 	table.NextRowID++
 
 	bt := LoadBTree(tm.pager, table.RootPageID)
@@ -271,6 +305,19 @@ func (tm *TableManager) InsertTx(tableName string, row *Row) (int, error) {
 	}
 
 	return rowID, tm.persistTableMeta(table)
+}
+
+// CheckUniqueConflict 检查唯一索引是否冲突。返回 (冲突的 rowID, 是否冲突)
+func (tm *TableManager) CheckUniqueConflict(idxBT *BTree, key []byte, currentRowID int) (int, bool) {
+	val, found, err := idxBT.Search(key)
+	if err != nil || !found {
+		return 0, false
+	}
+	existingRowID := DecodeIntKey(val)
+	if existingRowID == currentRowID {
+		return 0, false // 同一行，不冲突
+	}
+	return existingRowID, true
 }
 
 // DeleteSlot 标记删除指定位置的行（B+Tree 暂不支持物理删除，这里是兼容接口）
@@ -469,7 +516,7 @@ func (tm *TableManager) CreateIndex(tableName, indexName string, columns []strin
 }
 
 // BuildIndexKey 根据索引列从行数据构建索引 key
-// 格式: [col1_value][col2_value]...[rowid] — 确保唯一性
+// 格式: [col1_value][col2_value]...（唯一索引）或 [col1_value][col2_value]...[rowid]（非唯一索引）
 func (tm *TableManager) BuildIndexKey(table *Table, idx Index, row *Row, rowID int) ([]byte, error) {
 	var buf []byte
 	for _, colName := range idx.Columns {
@@ -509,8 +556,10 @@ func (tm *TableManager) BuildIndexKey(table *Table, idx Index, row *Row, rowID i
 			}
 		}
 	}
-	// 最后追加 rowID，确保即使索引列值相同也能区分不同行
-	buf = append(buf, EncodeIntKey(rowID)...)
+	// 非唯一索引：最后追加 rowID，确保相同列值的不同行有唯一 key
+	if !idx.Unique {
+		buf = append(buf, EncodeIntKey(rowID)...)
+	}
 	return buf, nil
 }
 
