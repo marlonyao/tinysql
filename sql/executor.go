@@ -35,6 +35,12 @@ func (e *Executor) Execute(stmt Statement) (Result, error) {
 		return e.executeInsert(s)
 	case *SelectStmt:
 		return e.executeSelect(s)
+	case *DeleteStmt:
+		return e.executeDelete(s)
+	case *UpdateStmt:
+		return e.executeUpdate(s)
+	case *CreateIndexStmt:
+		return e.executeCreateIndex(s)
 	case *TxBeginStmt:
 		return e.executeBegin()
 	case *TxCommitStmt:
@@ -71,6 +77,22 @@ type TxResult struct {
 	Message string
 }
 func (r *TxResult) resultNode() {}
+
+// DELETE / UPDATE / CREATE INDEX 结果
+type DeleteResult struct {
+	RowsAffected int
+}
+func (r *DeleteResult) resultNode() {}
+
+type UpdateResult struct {
+	RowsAffected int
+}
+func (r *UpdateResult) resultNode() {}
+
+type CreateIndexResult struct {
+	Message string
+}
+func (r *CreateIndexResult) resultNode() {}
 
 // === 事务执行 ===
 
@@ -428,4 +450,170 @@ func toInt64(v interface{}) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// === 执行 DELETE ===
+
+func (e *Executor) executeDelete(stmt *DeleteStmt) (Result, error) {
+	table, ok := e.tm.GetTable(stmt.TableName)
+	if !ok {
+		return nil, fmt.Errorf("table %s not found", stmt.TableName)
+	}
+
+	// 全表扫描获取所有行（需要 rowID 才能删除）
+	rows, rowIDs, err := e.tm.SelectAllWithRowID(stmt.TableName)
+	if err != nil {
+		return nil, err
+	}
+
+	// WHERE 过滤，收集要删除的 rowID
+	var toDelete []int
+	for i, row := range rows {
+		if stmt.Where != nil {
+			match, err := evalWhere(stmt.Where, row, table.Columns)
+			if err != nil {
+				return nil, err
+			}
+			if !match {
+				continue
+			}
+		}
+		toDelete = append(toDelete, rowIDs[i])
+	}
+
+	// 执行删除
+	for _, rowID := range toDelete {
+		if err := e.tm.DeleteByRowID(stmt.TableName, rowID); err != nil {
+			return nil, fmt.Errorf("delete row %d: %w", rowID, err)
+		}
+	}
+
+	return &DeleteResult{RowsAffected: len(toDelete)}, nil
+}
+
+// === 执行 UPDATE ===
+
+func (e *Executor) executeUpdate(stmt *UpdateStmt) (Result, error) {
+	table, ok := e.tm.GetTable(stmt.TableName)
+	if !ok {
+		return nil, fmt.Errorf("table %s not found", stmt.TableName)
+	}
+
+	// 全表扫描获取所有行
+	rows, rowIDs, err := e.tm.SelectAllWithRowID(stmt.TableName)
+	if err != nil {
+		return nil, err
+	}
+
+	// WHERE 过滤
+	var toUpdateRows []*storage.Row
+	var toUpdateIDs []int
+	for i, row := range rows {
+		if stmt.Where != nil {
+			match, err := evalWhere(stmt.Where, row, table.Columns)
+			if err != nil {
+				return nil, err
+			}
+			if !match {
+				continue
+			}
+		}
+		toUpdateRows = append(toUpdateRows, row)
+		toUpdateIDs = append(toUpdateIDs, rowIDs[i])
+	}
+
+	// 解析 SET 表达式为具体值（按列类型转换）
+	setValues := make(map[string]interface{})
+	for colName, expr := range stmt.Set {
+		// 找到列定义以获取类型
+		var colType storage.ColumnType
+		for _, col := range table.Columns {
+			if strings.EqualFold(col.Name, colName) {
+				colType = col.Type
+				break
+			}
+		}
+		val, err := evalExpr(expr, colType)
+		if err != nil {
+			return nil, err
+		}
+		setValues[colName] = val
+	}
+
+	// 逐行更新：聚簇索引 key (rowID) 不变，直接覆盖 value
+	updated := 0
+	for i, row := range toUpdateRows {
+		rowID := toUpdateIDs[i]
+
+		// 应用 SET
+		for colName, val := range setValues {
+			for j, col := range table.Columns {
+				if strings.EqualFold(col.Name, colName) {
+					// 类型转换
+					converted, err := convertValue(val, col.Type)
+					if err != nil {
+						return nil, err
+					}
+					row.Values[j] = converted
+					break
+				}
+			}
+		}
+
+		// 重新序列化并覆盖 BTree 中的记录（相同 key = 更新）
+		rowData, err := table.SerializeRow(row)
+		if err != nil {
+			return nil, fmt.Errorf("serialize row: %w", err)
+		}
+
+		bt := storage.LoadBTree(e.tm.GetPager(), table.RootPageID)
+		if err := bt.Insert(storage.EncodeIntKey(rowID), rowData); err != nil {
+			return nil, fmt.Errorf("btree update: %w", err)
+		}
+		// BTree 根可能变化
+		if bt.RootPageID() != table.RootPageID {
+			table.RootPageID = bt.RootPageID()
+		}
+		updated++
+	}
+
+	if updated > 0 {
+		// 更新表元数据（可能 rootPageID 变了）
+		if err := e.tm.PersistTableMeta(table); err != nil {
+			return nil, err
+		}
+	}
+
+	return &UpdateResult{RowsAffected: updated}, nil
+}
+
+// === 执行 CREATE INDEX ===
+
+func (e *Executor) executeCreateIndex(stmt *CreateIndexStmt) (Result, error) {
+	// 校验表存在
+	table, ok := e.tm.GetTable(stmt.TableName)
+	if !ok {
+		return nil, fmt.Errorf("table %s not found", stmt.TableName)
+	}
+
+	// 校验列存在
+	for _, colName := range stmt.Columns {
+		found := false
+		for _, col := range table.Columns {
+			if strings.EqualFold(col.Name, colName) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("column %s not found in table %s", colName, stmt.TableName)
+		}
+	}
+
+	// 创建二级索引（TableManager 负责）
+	if err := e.tm.CreateIndex(stmt.TableName, stmt.IndexName, stmt.Columns, stmt.Unique); err != nil {
+		return nil, err
+	}
+
+	return &CreateIndexResult{Message: fmt.Sprintf("Index %s created on %s", stmt.IndexName, stmt.TableName)}, nil
 }

@@ -19,7 +19,7 @@ func TestBTreeNodeTypes(t *testing.T) {
 	bt := NewBTree(pager)
 
 	for i := 0; i < 500; i++ {
-		if err := bt.Insert(encodeIntKey(i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+		if err := bt.Insert(EncodeIntKey(i), []byte(fmt.Sprintf("v%d", i))); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
@@ -32,8 +32,8 @@ func TestBTreeNodeTypes(t *testing.T) {
 		if nt == NodeTypeLeaf {
 			entries := na.leafEntries()
 			if len(entries) > 0 {
-				first := decodeIntKey(entries[0].key)
-				last := decodeIntKey(entries[len(entries)-1].key)
+				first := DecodeIntKey(entries[0].key)
+				last := DecodeIntKey(entries[len(entries)-1].key)
 				t.Logf("Page %d: LEAF, keys=[%d..%d] (%d entries), rs=%d", pid, first, last, len(entries), na.rightSibling())
 			}
 		} else {
@@ -41,7 +41,7 @@ func TestBTreeNodeTypes(t *testing.T) {
 			fc := na.firstChild()
 			t.Logf("Page %d: INTERNAL, firstChild=%d, entries=%d", pid, fc, len(entries))
 			for _, e := range entries {
-				t.Logf("  key=%d child=%d", decodeIntKey(e.key), e.childPageID)
+				t.Logf("  key=%d child=%d", DecodeIntKey(e.key), e.childPageID)
 			}
 		}
 	}

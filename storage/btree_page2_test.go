@@ -20,7 +20,7 @@ func TestBTreePage2Entries(t *testing.T) {
 
 	// 插入 500 条
 	for i := 0; i < 500; i++ {
-		if err := bt.Insert(encodeIntKey(i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+		if err := bt.Insert(EncodeIntKey(i), []byte(fmt.Sprintf("v%d", i))); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
@@ -31,7 +31,7 @@ func TestBTreePage2Entries(t *testing.T) {
 	entries := na.leafEntries()
 	t.Logf("Page 2 has %d entries", len(entries))
 	for i, e := range entries {
-		k := decodeIntKey(e.key)
+		k := DecodeIntKey(e.key)
 		v := string(e.value)
 		if i < 5 || i > len(entries)-5 {
 			t.Logf("  entry[%d]: key=%d, value=%s", i, k, v)
@@ -46,7 +46,7 @@ func TestBTreePage2Entries(t *testing.T) {
 	entries4 := na4.leafEntries()
 	t.Logf("Page 4 has %d entries", len(entries4))
 	for i, e := range entries4 {
-		k := decodeIntKey(e.key)
+		k := DecodeIntKey(e.key)
 		v := string(e.value)
 		if i < 5 || i > len(entries4)-5 {
 			t.Logf("  entry[%d]: key=%d, value=%s", i, k, v)

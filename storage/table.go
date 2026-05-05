@@ -37,12 +37,21 @@ type Column struct {
 	Primary  bool
 }
 
+// Index 二级索引定义
+type Index struct {
+	Name       string
+	Columns    []string // 索引列名（顺序重要，支持最左前缀）
+	RootPageID uint32   // BTree 根页
+	Unique     bool
+}
+
 // Table 表元数据
 type Table struct {
 	Name       string
 	Columns    []Column
-	RootPageID uint32 // B+Tree 聚簇索引根节点页ID
-	NextRowID  int    // 自增 _rowid 计数器
+	RootPageID uint32  // B+Tree 聚簇索引根节点页ID
+	NextRowID  int     // 自增 _rowid 计数器
+	Indexes    []Index // 二级索引列表
 }
 
 // Row 一行数据

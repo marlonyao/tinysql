@@ -405,7 +405,7 @@ func (bt *BTree) insertIntoNode(page *Page, key []byte, value []byte) (uint32, e
 		if len(childEntries) > 0 {
 			splitKey = childEntries[0].key
 		} else {
-			splitKey = encodeIntKey(int(newChildPageID)) // fallback
+			splitKey = EncodeIntKey(int(newChildPageID)) // fallback
 		}
 	}
 
@@ -620,17 +620,22 @@ func (bt *BTree) updateParentPointers(firstChild uint32, entries []internalEntry
 	}
 }
 
-// encodeIntKey 将 int 编码为 8 字节 BigEndian []byte，用于 BTree key
-func encodeIntKey(v int) []byte {
+// EncodeIntKey 将 int 编码为 8 字节 BigEndian []byte，用于 BTree key
+func EncodeIntKey(v int) []byte {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, uint64(v))
 	return b
 }
 
-// decodeIntKey 从 8 字节 BigEndian []byte 解码为 int
-func decodeIntKey(b []byte) int {
+// DecodeIntKey 从 8 字节 BigEndian []byte 解码为 int
+func DecodeIntKey(b []byte) int {
 	if len(b) != 8 {
 		return 0
 	}
 	return int(binary.BigEndian.Uint64(b))
+}
+
+// RootPageID 返回根页 ID
+func (bt *BTree) RootPageID() uint32 {
+	return bt.rootPageID
 }

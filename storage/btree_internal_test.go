@@ -20,7 +20,7 @@ func TestBTreeInternalStructure(t *testing.T) {
 
 	// 插入 500 条
 	for i := 0; i < 500; i++ {
-		if err := bt.Insert(encodeIntKey(i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+		if err := bt.Insert(EncodeIntKey(i), []byte(fmt.Sprintf("v%d", i))); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
@@ -34,7 +34,7 @@ func TestBTreeInternalStructure(t *testing.T) {
 		if na.nodeType() == NodeTypeInternal {
 			entries := na.internalEntries()
 			for i, e := range entries {
-				t.Logf("  entry[%d]: key=%d, child=%d", i, decodeIntKey(e.key), e.childPageID)
+				t.Logf("  entry[%d]: key=%d, child=%d", i, DecodeIntKey(e.key), e.childPageID)
 			}
 		}
 	}

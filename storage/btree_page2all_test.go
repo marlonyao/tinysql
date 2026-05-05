@@ -20,7 +20,7 @@ func TestBTreePage2AllEntries(t *testing.T) {
 
 	// 插入 500 条
 	for i := 0; i < 500; i++ {
-		if err := bt.Insert(encodeIntKey(i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+		if err := bt.Insert(EncodeIntKey(i), []byte(fmt.Sprintf("v%d", i))); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
@@ -30,10 +30,10 @@ func TestBTreePage2AllEntries(t *testing.T) {
 	na := newNodeAccessor(page)
 	entries := na.leafEntries()
 	for i, e := range entries {
-		k := decodeIntKey(e.key)
+		k := DecodeIntKey(e.key)
 		// 只打印不连续的
 		if i > 0 {
-			prev := decodeIntKey(entries[i-1].key)
+			prev := DecodeIntKey(entries[i-1].key)
 			if k != prev+1 {
 				t.Logf("  GAP! entry[%d]: key=%d (prev=%d, diff=%d)", i, k, prev, k-prev)
 			}

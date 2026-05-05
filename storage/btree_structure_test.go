@@ -20,7 +20,7 @@ func TestBTreeStructure(t *testing.T) {
 
 	// 插入 500 条
 	for i := 0; i < 500; i++ {
-		if err := bt.Insert(encodeIntKey(i), []byte(fmt.Sprintf("v%d", i))); err != nil {
+		if err := bt.Insert(EncodeIntKey(i), []byte(fmt.Sprintf("v%d", i))); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
@@ -43,8 +43,8 @@ func TestBTreeStructure(t *testing.T) {
 		na := newNodeAccessor(page)
 		entries := na.leafEntries()
 		if len(entries) > 0 {
-			firstKey := decodeIntKey(entries[0].key)
-			lastKey := decodeIntKey(entries[len(entries)-1].key)
+			firstKey := DecodeIntKey(entries[0].key)
+			lastKey := DecodeIntKey(entries[len(entries)-1].key)
 			t.Logf("Page %d: keys %d..%d (entries=%d, right=%d)", pageID, firstKey, lastKey, len(entries), na.rightSibling())
 		} else {
 			t.Logf("Page %d: EMPTY (right=%d)", pageID, na.rightSibling())

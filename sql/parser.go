@@ -37,6 +37,31 @@ type SelectStmt struct {
 
 func (s *SelectStmt) stmtNode() {}
 
+// DELETE / UPDATE / CREATE INDEX
+type DeleteStmt struct {
+	TableName string
+	Where     Expr // 可为 nil
+}
+
+func (s *DeleteStmt) stmtNode() {}
+
+type UpdateStmt struct {
+	TableName string
+	Set       map[string]Expr // col -> expr
+	Where     Expr              // 可为 nil
+}
+
+func (s *UpdateStmt) stmtNode() {}
+
+type CreateIndexStmt struct {
+	IndexName string
+	TableName string
+	Columns   []string
+	Unique    bool
+}
+
+func (s *CreateIndexStmt) stmtNode() {}
+
 // 事务语句
 type TxBeginStmt struct{}
 func (s *TxBeginStmt) stmtNode() {}
@@ -112,6 +137,8 @@ var keywords = map[string]struct{}{
 	"VARCHAR": {}, "TEXT": {}, "BOOL": {}, "VALUES": {}, "TRUE": {},
 	"FALSE": {}, "PRIMARY": {}, "KEY": {},
 	"BEGIN": {}, "COMMIT": {}, "ROLLBACK": {},
+	"DELETE": {}, "UPDATE": {}, "SET": {}, "INDEX": {}, "ON": {},
+	"DROP": {}, "UNIQUE": {},
 }
 
 func tokenize(input string) ([]Token, error) {
@@ -275,11 +302,15 @@ func (p *Parser) Parse() (Statement, error) {
 
 	switch strings.ToUpper(tok.Value) {
 	case "CREATE":
-		return p.parseCreateTable()
+		return p.parseCreate()
 	case "INSERT":
 		return p.parseInsert()
 	case "SELECT":
 		return p.parseSelect()
+	case "DELETE":
+		return p.parseDelete()
+	case "UPDATE":
+		return p.parseUpdate()
 	case "BEGIN":
 		return p.parseBegin()
 	case "COMMIT":
@@ -291,10 +322,27 @@ func (p *Parser) Parse() (Statement, error) {
 	}
 }
 
+// parseCreate: CREATE TABLE / CREATE [UNIQUE] INDEX
+func (p *Parser) parseCreate() (Statement, error) {
+	p.advance() // CREATE
+	switch strings.ToUpper(p.peek().Value) {
+	case "TABLE":
+		return p.parseCreateTable()
+	case "INDEX":
+		p.advance() // INDEX
+		return p.parseCreateIndex()
+	case "UNIQUE":
+		p.advance() // UNIQUE
+		p.expect(TokenKeyword, "INDEX")
+		return p.parseCreateIndexWithUnique(true)
+	default:
+		return nil, fmt.Errorf("expected TABLE or INDEX after CREATE, got %s", p.peek().Value)
+	}
+}
+
 // parseCreateTable: CREATE TABLE name (col1 INT, col2 VARCHAR(255), ...)
 func (p *Parser) parseCreateTable() (*CreateTableStmt, error) {
-	p.advance() // CREATE
-	p.expect(TokenKeyword, "TABLE")
+	p.advance() // TABLE
 	tok, _ := p.expect(TokenIdentifier)
 	stmt := &CreateTableStmt{TableName: tok.Value}
 
@@ -513,6 +561,84 @@ func (p *Parser) parseCommit() (*TxCommitStmt, error) {
 func (p *Parser) parseRollback() (*TxRollbackStmt, error) {
 	p.advance() // ROLLBACK
 	return &TxRollbackStmt{}, nil
+}
+
+// parseCreateIndex: CREATE [UNIQUE] INDEX idx_name ON table_name (col1, col2);
+func (p *Parser) parseCreateIndex() (*CreateIndexStmt, error) {
+	return p.parseCreateIndexWithUnique(false)
+}
+
+func (p *Parser) parseCreateIndexWithUnique(unique bool) (*CreateIndexStmt, error) {
+	tok, _ := p.expect(TokenIdentifier) // index name
+	stmt := &CreateIndexStmt{IndexName: tok.Value, Unique: unique}
+	p.expect(TokenKeyword, "ON")
+	tableTok, _ := p.expect(TokenIdentifier)
+	stmt.TableName = tableTok.Value
+
+	p.expect(TokenSymbol, "(")
+	for {
+		colTok, _ := p.expect(TokenIdentifier)
+		stmt.Columns = append(stmt.Columns, colTok.Value)
+		if p.peek().Value == ")" {
+			break
+		}
+		p.expect(TokenSymbol, ",")
+	}
+	p.expect(TokenSymbol, ")")
+	p.expect(TokenSymbol, ";")
+	return stmt, nil
+}
+
+// parseDelete: DELETE FROM table_name [WHERE expr];
+func (p *Parser) parseDelete() (*DeleteStmt, error) {
+	p.advance() // DELETE
+	p.expect(TokenKeyword, "FROM")
+	tok, _ := p.expect(TokenIdentifier)
+	stmt := &DeleteStmt{TableName: tok.Value}
+
+	if strings.EqualFold(p.peek().Value, "WHERE") {
+		p.advance()
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Where = expr
+	}
+	p.expect(TokenSymbol, ";")
+	return stmt, nil
+}
+
+// parseUpdate: UPDATE table_name SET col1=expr1 [, col2=expr2] [WHERE expr];
+func (p *Parser) parseUpdate() (*UpdateStmt, error) {
+	p.advance() // UPDATE
+	tok, _ := p.expect(TokenIdentifier)
+	stmt := &UpdateStmt{TableName: tok.Value, Set: make(map[string]Expr)}
+	p.expect(TokenKeyword, "SET")
+
+	for {
+		colTok, _ := p.expect(TokenIdentifier)
+		p.expect(TokenSymbol, "=")
+		expr, err := p.parsePrimaryExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Set[colTok.Value] = expr
+		if p.peek().Value != "," {
+			break
+		}
+		p.advance() // ,
+	}
+
+	if strings.EqualFold(p.peek().Value, "WHERE") {
+		p.advance()
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Where = expr
+	}
+	p.expect(TokenSymbol, ";")
+	return stmt, nil
 }
 
 // ParseSQL 便捷函数

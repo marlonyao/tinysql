@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // PageTypeTableData 是存行数据的页类型
@@ -54,11 +55,12 @@ func (tm *TableManager) persistTableMeta(table *Table) error {
 		"columns":    table.Columns,
 		"rootPageID": table.RootPageID,
 		"nextRowID":  table.NextRowID,
+		"indexes":    table.Indexes,
 	}
 
 	// 读出现有表定义列表，追加
 	metaPage := tm.pager.GetPage(0)
-	
+
 	// 简单方案：每次重写全部表定义
 	allMetas := make([]map[string]interface{}, 0)
 	count := binary.LittleEndian.Uint32(metaPage.Data()[0:4])
@@ -70,7 +72,7 @@ func (tm *TableManager) persistTableMeta(table *Table) error {
 			allMetas = existingList
 		}
 	}
-	
+
 	// 检查是否已存在，存在则更新
 	found := false
 	for i, m := range allMetas {
@@ -83,12 +85,12 @@ func (tm *TableManager) persistTableMeta(table *Table) error {
 	if !found {
 		allMetas = append(allMetas, meta)
 	}
-	
+
 	allJSON, err := json.Marshal(allMetas)
 	if err != nil {
 		return err
 	}
-	
+
 	// page 0 data area layout:
 	// Data()[0:4]  = data[16:20] = tableCount
 	// Data()[4:8]  = data[20:24] = nextPageID (managed by Pager, DON'T TOUCH)
@@ -96,11 +98,11 @@ func (tm *TableManager) persistTableMeta(table *Table) error {
 	if len(allJSON) > len(metaPage.Data())-8 {
 		return fmt.Errorf("table metadata too large for page 0")
 	}
-	
+
 	binary.LittleEndian.PutUint32(metaPage.Data()[0:4], uint32(len(allMetas)))
 	copy(metaPage.Data()[8:], allJSON)
 	metaPage.SetDirty(true)
-	
+
 	return tm.pager.Flush(0)
 }
 
@@ -126,21 +128,21 @@ func (tm *TableManager) LoadTables() error {
 	if count == 0 {
 		return nil
 	}
-	
+
 	data := bytes.TrimRight(metaPage.Data()[8:], "\x00")
 	var allMetas []map[string]interface{}
 	if err := json.Unmarshal(data, &allMetas); err != nil {
 		return fmt.Errorf("parse table metadata: %w", err)
 	}
-	
+
 	for _, m := range allMetas {
 		name, _ := m["name"].(string)
-		
+
 		// 解析 columns
 		colsRaw, _ := json.Marshal(m["columns"])
 		var columns []Column
 		json.Unmarshal(colsRaw, &columns)
-		
+
 		// 解析 rootPageID
 		var rootPageID uint32
 		switch v := m["rootPageID"].(type) {
@@ -149,7 +151,7 @@ func (tm *TableManager) LoadTables() error {
 		case uint32:
 			rootPageID = v
 		}
-		
+
 		// 解析 nextRowID
 		var nextRowID int
 		switch v := m["nextRowID"].(type) {
@@ -158,19 +160,27 @@ func (tm *TableManager) LoadTables() error {
 		case int:
 			nextRowID = v
 		}
-		
+
+		// 解析 indexes
+		var indexes []Index
+		if idxRaw, ok := m["indexes"]; ok {
+			raw, _ := json.Marshal(idxRaw)
+			json.Unmarshal(raw, &indexes)
+		}
+
 		tm.tables[name] = &Table{
 			Name:       name,
 			Columns:    columns,
 			RootPageID: rootPageID,
 			NextRowID:  nextRowID,
+			Indexes:    indexes,
 		}
 	}
-	
+
 	return nil
 }
 
-// Insert 向表中插入一行（B+Tree 聚簇索引）
+// Insert 向表中插入一行（B+Tree 聚簇索引 + 二级索引）
 func (tm *TableManager) Insert(tableName string, row *Row) error {
 	table, ok := tm.tables[tableName]
 	if !ok {
@@ -187,7 +197,7 @@ func (tm *TableManager) Insert(tableName string, row *Row) error {
 	table.NextRowID++
 
 	bt := LoadBTree(tm.pager, table.RootPageID)
-	if err := bt.Insert(encodeIntKey(rowID), rowData); err != nil {
+	if err := bt.Insert(EncodeIntKey(rowID), rowData); err != nil {
 		return fmt.Errorf("btree insert: %w", err)
 	}
 	// BTree 分裂可能导致根节点变化，需要同步
@@ -195,7 +205,23 @@ func (tm *TableManager) Insert(tableName string, row *Row) error {
 		table.RootPageID = bt.rootPageID
 	}
 
-	// 更新表元数据（nextRowID 和可能的 rootPageID 变化）
+	// 维护二级索引
+	for i := range table.Indexes {
+		idx := &table.Indexes[i]
+		idxBT := LoadBTree(tm.pager, idx.RootPageID)
+		key, err := tm.buildIndexKey(table, *idx, row, rowID)
+		if err != nil {
+			return fmt.Errorf("build index key for %s: %w", idx.Name, err)
+		}
+		if err := idxBT.Insert(key, EncodeIntKey(rowID)); err != nil {
+			return fmt.Errorf("index %s insert: %w", idx.Name, err)
+		}
+		if idxBT.rootPageID != idx.RootPageID {
+			idx.RootPageID = idxBT.rootPageID
+		}
+	}
+
+	// 更新表元数据（nextRowID、rootPageID、索引 rootPageID 变化）
 	return tm.persistTableMeta(table)
 }
 
@@ -215,12 +241,28 @@ func (tm *TableManager) InsertTx(tableName string, row *Row) (int, error) {
 	table.NextRowID++
 
 	bt := LoadBTree(tm.pager, table.RootPageID)
-	if err := bt.Insert(encodeIntKey(rowID), rowData); err != nil {
+	if err := bt.Insert(EncodeIntKey(rowID), rowData); err != nil {
 		return 0, fmt.Errorf("btree insert: %w", err)
 	}
 	// BTree 分裂可能导致根节点变化，需要同步
 	if bt.rootPageID != table.RootPageID {
 		table.RootPageID = bt.rootPageID
+	}
+
+	// 维护二级索引
+	for i := range table.Indexes {
+		idx := &table.Indexes[i]
+		idxBT := LoadBTree(tm.pager, idx.RootPageID)
+		key, err := tm.buildIndexKey(table, *idx, row, rowID)
+		if err != nil {
+			return 0, fmt.Errorf("build index key for %s: %w", idx.Name, err)
+		}
+		if err := idxBT.Insert(key, EncodeIntKey(rowID)); err != nil {
+			return 0, fmt.Errorf("index %s insert: %w", idx.Name, err)
+		}
+		if idxBT.rootPageID != idx.RootPageID {
+			idx.RootPageID = idxBT.rootPageID
+		}
 	}
 
 	return rowID, tm.persistTableMeta(table)
@@ -231,14 +273,45 @@ func (tm *TableManager) DeleteSlot(tableName string, pageID uint32, slotIdx int)
 	return fmt.Errorf("delete not supported with btree storage")
 }
 
-// DeleteByRowID 按 RowID 删除
+// DeleteByRowID 按 RowID 删除（聚簇索引 + 二级索引）
 func (tm *TableManager) DeleteByRowID(tableName string, rowID int) error {
 	table, ok := tm.tables[tableName]
 	if !ok {
 		return fmt.Errorf("table %s not found", tableName)
 	}
+
+	// 先读出该行数据，用于删除二级索引
 	bt := LoadBTree(tm.pager, table.RootPageID)
-	if err := bt.Delete(encodeIntKey(rowID)); err != nil {
+	rowData, found, err := bt.Search(EncodeIntKey(rowID))
+	if err != nil {
+		return fmt.Errorf("btree search: %w", err)
+	}
+	if !found {
+		return nil // 已经不存在，无需删除
+	}
+	row, err := table.DeserializeRow(rowData)
+	if err != nil {
+		return fmt.Errorf("deserialize row: %w", err)
+	}
+
+	// 删除二级索引
+	for i := range table.Indexes {
+		idx := &table.Indexes[i]
+		idxBT := LoadBTree(tm.pager, idx.RootPageID)
+		key, err := tm.buildIndexKey(table, *idx, row, rowID)
+		if err != nil {
+			return fmt.Errorf("build index key for %s: %w", idx.Name, err)
+		}
+		if err := idxBT.Delete(key); err != nil {
+			return fmt.Errorf("index %s delete: %w", idx.Name, err)
+		}
+		if idxBT.rootPageID != idx.RootPageID {
+			idx.RootPageID = idxBT.rootPageID
+		}
+	}
+
+	// 删除聚簇索引
+	if err := bt.Delete(EncodeIntKey(rowID)); err != nil {
 		return fmt.Errorf("btree delete: %w", err)
 	}
 	// BTree 合并可能导致根节点变化（简化版暂不合并，但保留检查）
@@ -251,6 +324,129 @@ func (tm *TableManager) DeleteByRowID(tableName string, rowID int) error {
 // GetPager 返回底层 Pager
 func (tm *TableManager) GetPager() *Pager {
 	return tm.pager
+}
+
+// SelectAllWithRowID 返回所有行和对应的 rowID
+func (tm *TableManager) SelectAllWithRowID(tableName string) ([]*Row, []int, error) {
+	table, ok := tm.tables[tableName]
+	if !ok {
+		return nil, nil, fmt.Errorf("table %s not found", tableName)
+	}
+
+	bt := LoadBTree(tm.pager, table.RootPageID)
+	pairs, err := bt.RangeScan(EncodeIntKey(0), EncodeIntKey(table.NextRowID))
+	if err != nil {
+		return nil, nil, fmt.Errorf("btree scan: %w", err)
+	}
+
+	var rows []*Row
+	var rowIDs []int
+	for _, pair := range pairs {
+		row, err := table.DeserializeRow(pair.Value)
+		if err != nil {
+			return nil, nil, fmt.Errorf("deserialize row %d: %w", pair.Key, err)
+		}
+		rows = append(rows, row)
+		rowIDs = append(rowIDs, DecodeIntKey(pair.Key))
+	}
+	return rows, rowIDs, nil
+}
+
+// PersistTableMeta 公开持久化表元数据接口
+func (tm *TableManager) PersistTableMeta(table *Table) error {
+	return tm.persistTableMeta(table)
+}
+
+// CreateIndex 创建二级索引：分配 BTree，遍历全表数据填充索引
+func (tm *TableManager) CreateIndex(tableName, indexName string, columns []string, unique bool) error {
+	table, ok := tm.tables[tableName]
+	if !ok {
+		return fmt.Errorf("table %s not found", tableName)
+	}
+	// 检查索引名是否已存在
+	for _, idx := range table.Indexes {
+		if idx.Name == indexName {
+			return fmt.Errorf("index %s already exists", indexName)
+		}
+	}
+
+	// 创建新 BTree 作为索引
+	bt := NewBTree(tm.pager)
+	idx := Index{
+		Name:       indexName,
+		Columns:    columns,
+		RootPageID: bt.rootPageID,
+		Unique:     unique,
+	}
+	table.Indexes = append(table.Indexes, idx)
+
+	// 遍历全表数据，为每一行构建索引 key 并插入
+	rows, rowIDs, err := tm.SelectAllWithRowID(tableName)
+	if err != nil {
+		return fmt.Errorf("scan table for index: %w", err)
+	}
+
+	for i, row := range rows {
+		rowID := rowIDs[i]
+		key, err := tm.buildIndexKey(table, idx, row, rowID)
+		if err != nil {
+			return err
+		}
+		// 二级索引 value = rowID
+		if err := bt.Insert(key, EncodeIntKey(rowID)); err != nil {
+			return fmt.Errorf("index insert: %w", err)
+		}
+	}
+	// 更新索引的根页ID（分裂后可能变化）
+	table.Indexes[len(table.Indexes)-1].RootPageID = bt.rootPageID
+
+	return tm.persistTableMeta(table)
+}
+
+// buildIndexKey 根据索引列从行数据构建索引 key
+// 格式: [col1_value][col2_value]...[rowid] — 确保唯一性
+func (tm *TableManager) buildIndexKey(table *Table, idx Index, row *Row, rowID int) ([]byte, error) {
+	var buf []byte
+	for _, colName := range idx.Columns {
+		colIdx := -1
+		for j, col := range table.Columns {
+			if strings.EqualFold(col.Name, colName) {
+				colIdx = j
+				break
+			}
+		}
+		if colIdx == -1 {
+			return nil, fmt.Errorf("column %s not found", colName)
+		}
+		val := row.Values[colIdx]
+		if val == nil {
+			// NULL 用特殊标记
+			buf = append(buf, 0x00)
+			continue
+		}
+		buf = append(buf, 0x01) // non-NULL marker
+		switch table.Columns[colIdx].Type {
+		case TypeInt:
+			v, _ := val.(int)
+			b := make([]byte, 8)
+			binary.BigEndian.PutUint64(b, uint64(v))
+			buf = append(buf, b...)
+		case TypeVarchar:
+			v, _ := val.(string)
+			buf = append(buf, []byte(v)...)
+			buf = append(buf, 0x00) // string terminator
+		case TypeBool:
+			v, _ := val.(bool)
+			if v {
+				buf = append(buf, 0x01)
+			} else {
+				buf = append(buf, 0x00)
+			}
+		}
+	}
+	// 最后追加 rowID，确保即使索引列值相同也能区分不同行
+	buf = append(buf, EncodeIntKey(rowID)...)
+	return buf, nil
 }
 
 // insertIntoPageInternal 核心插入逻辑
@@ -338,7 +534,7 @@ func (tm *TableManager) SelectAll(tableName string) ([]*Row, error) {
 	}
 
 	bt := LoadBTree(tm.pager, table.RootPageID)
-	pairs, err := bt.RangeScan(encodeIntKey(0), encodeIntKey(table.NextRowID))
+	pairs, err := bt.RangeScan(EncodeIntKey(0), EncodeIntKey(table.NextRowID))
 	if err != nil {
 		return nil, fmt.Errorf("btree scan: %w", err)
 	}
@@ -393,11 +589,11 @@ func (tm *TableManager) getFirstDataPage(tableName string) uint32 {
 	if count == 0 {
 		return 0
 	}
-	
+
 	data := bytes.TrimRight(metaPage.Data()[8:], "\x00")
 	var allMetas []map[string]interface{}
 	json.Unmarshal(data, &allMetas)
-	
+
 	for _, m := range allMetas {
 		if m["name"] == tableName {
 			// 解析 firstDataPage (JSON number -> float64)

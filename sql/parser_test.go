@@ -184,3 +184,103 @@ func TestParseInsertNull(t *testing.T) {
 		t.Fatalf("expected NULL, got %v", v1.Value)
 	}
 }
+
+func TestParseDelete(t *testing.T) {
+	input := `DELETE FROM users WHERE id = 1;`
+	stmt, err := ParseSQL(input)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	del, ok := stmt.(*DeleteStmt)
+	if !ok {
+		t.Fatalf("expected DeleteStmt, got %T", stmt)
+	}
+	if del.TableName != "users" {
+		t.Fatalf("expected table 'users', got '%s'", del.TableName)
+	}
+	if del.Where == nil {
+		t.Fatalf("expected WHERE clause")
+	}
+}
+
+func TestParseDeleteNoWhere(t *testing.T) {
+	input := `DELETE FROM users;`
+	stmt, err := ParseSQL(input)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	del, ok := stmt.(*DeleteStmt)
+	if !ok {
+		t.Fatalf("expected DeleteStmt, got %T", stmt)
+	}
+	if del.Where != nil {
+		t.Fatalf("expected no WHERE clause")
+	}
+}
+
+func TestParseUpdate(t *testing.T) {
+	input := `UPDATE users SET name = 'Bob', age = 30 WHERE id = 1;`
+	stmt, err := ParseSQL(input)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	upd, ok := stmt.(*UpdateStmt)
+	if !ok {
+		t.Fatalf("expected UpdateStmt, got %T", stmt)
+	}
+	if upd.TableName != "users" {
+		t.Fatalf("expected table 'users', got '%s'", upd.TableName)
+	}
+	if len(upd.Set) != 2 {
+		t.Fatalf("expected 2 set clauses, got %d", len(upd.Set))
+	}
+	if upd.Set["name"].(*Literal).Value != "Bob" {
+		t.Fatalf("expected name='Bob', got %v", upd.Set["name"])
+	}
+	if upd.Set["age"].(*Literal).Value != 30 {
+		t.Fatalf("expected age=30, got %v", upd.Set["age"])
+	}
+}
+
+func TestParseCreateIndex(t *testing.T) {
+	input := `CREATE INDEX idx_name ON users (name);`
+	stmt, err := ParseSQL(input)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ci, ok := stmt.(*CreateIndexStmt)
+	if !ok {
+		t.Fatalf("expected CreateIndexStmt, got %T", stmt)
+	}
+	if ci.IndexName != "idx_name" {
+		t.Fatalf("expected index name 'idx_name', got '%s'", ci.IndexName)
+	}
+	if ci.TableName != "users" {
+		t.Fatalf("expected table 'users', got '%s'", ci.TableName)
+	}
+	if len(ci.Columns) != 1 || ci.Columns[0] != "name" {
+		t.Fatalf("expected columns [name], got %v", ci.Columns)
+	}
+	if ci.Unique {
+		t.Fatalf("expected non-unique index")
+	}
+}
+
+func TestParseCreateUniqueIndex(t *testing.T) {
+	input := `CREATE UNIQUE INDEX idx_name ON users (name, age);`
+	stmt, err := ParseSQL(input)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ci, ok := stmt.(*CreateIndexStmt)
+	if !ok {
+		t.Fatalf("expected CreateIndexStmt, got %T", stmt)
+	}
+	if !ci.Unique {
+		t.Fatalf("expected unique index")
+	}
+	if len(ci.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(ci.Columns))
+	}
+}
+
