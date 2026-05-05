@@ -26,6 +26,14 @@ func NewExecutorWithTx(tm *storage.TableManager, txm *tx.TransactionManager) *Ex
 	return &Executor{tm: tm, txm: txm}
 }
 
+// currentTrxID 返回当前事务 ID，无事务时返回 0
+func (e *Executor) currentTrxID() uint64 {
+	if e.currentTx != nil {
+		return e.currentTx.ID
+	}
+	return 0
+}
+
 // Execute 执行 SQL 语句
 func (e *Executor) Execute(stmt Statement) (Result, error) {
 	switch s := stmt.(type) {
@@ -571,7 +579,7 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) (Result, error) {
 		if row.TrxID != 0 {
 			rollPtr = row.RollPtr
 		}
-		undoID, err := e.tm.WriteUndoRecord(1, stmt.TableName, rowID, oldValues, row.TrxID, rollPtr, 2) // 2=UPDATE
+		undoID, err := e.tm.WriteUndoRecord(e.currentTrxID(), stmt.TableName, rowID, oldValues, row.TrxID, rollPtr, 2) // 2=UPDATE
 		if err != nil {
 			return nil, fmt.Errorf("write undo: %w", err)
 		}
@@ -590,8 +598,8 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) (Result, error) {
 			}
 		}
 
-		// 更新 MVCC 元信息（TODO: trx_id 应从当前活跃事务获取）
-		row.TrxID = 1
+		// 更新 MVCC 元信息
+		row.TrxID = e.currentTrxID()
 		row.RollPtr = undoID
 
 		// 重新序列化并覆盖聚簇索引
