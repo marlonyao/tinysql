@@ -9,10 +9,11 @@ import (
 
 // TransactionManager 事务管理器
 type TransactionManager struct {
-	tm       *storage.TableManager
-	wal      *WAL
-	mu       sync.Mutex
-	nextTxID uint64
+	tm        *storage.TableManager
+	wal       *WAL
+	mu        sync.Mutex
+	nextTxID  uint64
+	activeTxs *activeTxSet
 }
 
 // NewTransactionManager 创建事务管理器
@@ -23,9 +24,10 @@ func NewTransactionManager(tm *storage.TableManager, walPath string) (*Transacti
 	}
 
 	return &TransactionManager{
-		tm:       tm,
-		wal:      wal,
-		nextTxID: 1,
+		tm:        tm,
+		wal:       wal,
+		nextTxID:  1,
+		activeTxs: newActiveTxSet(),
 	}, nil
 }
 
@@ -47,6 +49,8 @@ func (txm *TransactionManager) Begin() (*Transaction, error) {
 	if err := txm.wal.Flush(); err != nil {
 		return nil, fmt.Errorf("flush begin: %w", err)
 	}
+
+	txm.activeTxs.Add(txID)
 
 	return &Transaction{
 		ID:         txID,
@@ -89,6 +93,7 @@ func (txm *TransactionManager) Commit(tx *Transaction) error {
 		return fmt.Errorf("truncate wal: %w", err)
 	}
 
+	txm.activeTxs.Remove(tx.ID)
 	tx.active = false
 	return nil
 }
@@ -138,6 +143,7 @@ func (txm *TransactionManager) Rollback(tx *Transaction) error {
 		return fmt.Errorf("truncate wal: %w", err)
 	}
 
+	txm.activeTxs.Remove(tx.ID)
 	tx.active = false
 	return nil
 }
@@ -193,6 +199,26 @@ type Transaction struct {
 	pager      *storage.Pager
 	dirtyPages map[uint32]bool
 	active     bool
+	readView   *ReadView // MVCC 快照（事务开始时创建）
+}
+
+// NewReadView 为当前事务创建 ReadView（Repeatable Read 语义）
+func (txm *TransactionManager) NewReadView(trxID uint64) *ReadView {
+	min, _, active := txm.activeTxs.Snapshot()
+	return &ReadView{
+		CreatorTrxID: trxID,
+		MinTrxID:     min,
+		MaxTrxID:     txm.nextTxID, // 全局下一个要分配的 ID = 已分配最大 ID + 1
+		ActiveIDs:    active,
+	}
+}
+
+// GetReadView 获取事务的 ReadView（懒创建）
+func (tx *Transaction) GetReadView(txm *TransactionManager) *ReadView {
+	if tx.readView == nil {
+		tx.readView = txm.NewReadView(tx.ID)
+	}
+	return tx.readView
 }
 
 // Insert 事务内插入一行

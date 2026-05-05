@@ -56,7 +56,9 @@ type Table struct {
 
 // Row 一行数据
 type Row struct {
-	Values []interface{} // 按 Columns 顺序
+	Values  []interface{} // 按 Columns 顺序
+	TrxID   uint64        // 创建/最后修改该版本的事务ID
+	RollPtr uint64        // 指向 undo record（0 表示无旧版本）
 }
 
 // 行格式（简化版）：
@@ -110,6 +112,10 @@ func (t *Table) SerializeRow(row *Row) ([]byte, error) {
 	// 第二阶段：写入
 	buf := new(bytes.Buffer)
 	buf.Write(nullBitmap)
+
+	// MVCC 隐藏列：trx_id (8 bytes) + roll_ptr (8 bytes)
+	binary.Write(buf, binary.BigEndian, row.TrxID)
+	binary.Write(buf, binary.BigEndian, row.RollPtr)
 
 	varcharBuf := new(bytes.Buffer)
 	varcharDataStart := make([]uint16, len(t.Columns)) // 记录每个 varchar 在变长区的起始位置
@@ -168,13 +174,17 @@ func (t *Table) SerializeRow(row *Row) ([]byte, error) {
 // DeserializeRow 将字节反序列化为 Row
 func (t *Table) DeserializeRow(data []byte) (*Row, error) {
 	nullBitmapSize := (len(t.Columns) + 7) / 8
-	if len(data) < nullBitmapSize {
-		return nil, fmt.Errorf("data too short for null bitmap: got %d bytes, need %d", len(data), nullBitmapSize)
+	if len(data) < nullBitmapSize+16 {
+		return nil, fmt.Errorf("data too short for null bitmap + mvcc headers: got %d bytes, need %d", len(data), nullBitmapSize+16)
 	}
 
 	row := &Row{Values: make([]interface{}, len(t.Columns))}
 	nullBitmap := data[0:nullBitmapSize]
 	
+	// 读取 MVCC 隐藏列
+	row.TrxID = binary.BigEndian.Uint64(data[nullBitmapSize : nullBitmapSize+8])
+	row.RollPtr = binary.BigEndian.Uint64(data[nullBitmapSize+8 : nullBitmapSize+16])
+
 	// 计算定长区大小（所有字段都占位置）
 	fixedSize := 0
 	for _, col := range t.Columns {
@@ -188,8 +198,8 @@ func (t *Table) DeserializeRow(data []byte) (*Row, error) {
 		}
 	}
 
-	fixedOffset := nullBitmapSize // 当前在定长区的偏移
-	varOffset := nullBitmapSize + fixedSize // 变长区起始
+	fixedOffset := nullBitmapSize + 16 // 当前在定长区的偏移
+	varOffset := fixedOffset + fixedSize // 变长区起始
 
 	for i, col := range t.Columns {
 		isNull := nullBitmap[i/8]&(1<<(i%8)) != 0

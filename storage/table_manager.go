@@ -13,18 +13,23 @@ const PageTypeTableData = 5
 
 // TableManager 管理所有表和行数据
 type TableManager struct {
-	pager  *Pager
-	tables map[string]*Table // 内存中的表定义
+	pager      *Pager
+	tables     map[string]*Table // 内存中的表定义
+	undoBTree  *BTree            // MVCC undo log BTree
+	nextUndoID uint64            // 自增 undo ID
 }
 
-// NewTableManager 创建表管理器（自动从磁盘加载已有表定义）
+// NewTableManager 创建表管理器（自动从磁盘加载已有表定义 + undo BTree）
 func NewTableManager(pager *Pager) *TableManager {
 	tm := &TableManager{
-		pager:  pager,
-		tables: make(map[string]*Table),
+		pager:      pager,
+		tables:     make(map[string]*Table),
+		nextUndoID: 1, // 0 作为 RollPtr 的哨兵值（无旧版本），undo ID 从 1 开始
 	}
 	// 自动加载已有的表定义
 	_ = tm.LoadTables()
+	// 加载或创建 undo BTree
+	tm.loadOrCreateUndoBTree()
 	return tm
 }
 
@@ -352,6 +357,66 @@ func (tm *TableManager) SelectAllWithRowID(tableName string) ([]*Row, []int, err
 	return rows, rowIDs, nil
 }
 
+// SelectAllWithReadView 返回对给定 ReadView 可见的所有行和 rowID
+// 不可见的行通过 undo 链回溯旧版本
+func (tm *TableManager) SelectAllWithReadView(tableName string, readView interface{ IsVisible(trxID uint64) bool }) ([]*Row, []int, error) {
+	table, ok := tm.tables[tableName]
+	if !ok {
+		return nil, nil, fmt.Errorf("table %s not found", tableName)
+	}
+
+	bt := LoadBTree(tm.pager, table.RootPageID)
+	pairs, err := bt.RangeScan(EncodeIntKey(0), EncodeIntKey(table.NextRowID))
+	if err != nil {
+		return nil, nil, fmt.Errorf("btree scan: %w", err)
+	}
+
+	var rows []*Row
+	var rowIDs []int
+	for _, pair := range pairs {
+		rowID := DecodeIntKey(pair.Key)
+		row, err := table.DeserializeRow(pair.Value)
+		if err != nil {
+			return nil, nil, fmt.Errorf("deserialize row %d: %w", rowID, err)
+		}
+
+		// MVCC 可见性判断 + undo 链回溯
+		visibleRow, visible := tm.findVisibleVersion(row, readView, table)
+		if !visible {
+			continue // 没有任何可见版本
+		}
+		rows = append(rows, visibleRow)
+		rowIDs = append(rowIDs, rowID)
+	}
+	return rows, rowIDs, nil
+}
+
+// findVisibleVersion 对给定行做可见性判断，不可见时沿 undo 链回溯
+func (tm *TableManager) findVisibleVersion(row *Row, readView interface{ IsVisible(trxID uint64) bool }, table *Table) (*Row, bool) {
+	current := row
+	for {
+		if readView.IsVisible(current.TrxID) {
+			return current, true
+		}
+		// 不可见，尝试 undo 链回溯
+		if current.RollPtr == 0 {
+			return nil, false // 没有更老的版本了
+		}
+		rec, err := tm.ReadUndoRecord(current.RollPtr)
+		if err != nil {
+			return nil, false // undo record 读失败，视为不可见
+		}
+		// 用 undo record 的 OldValues 重建旧版本行
+		oldRow := &Row{
+			Values:  make([]interface{}, len(rec.OldValues)),
+			TrxID:   rec.OldTrxID,
+			RollPtr: rec.RollPtr,
+		}
+		copy(oldRow.Values, rec.OldValues)
+		current = oldRow
+	}
+}
+
 // PersistTableMeta 公开持久化表元数据接口
 func (tm *TableManager) PersistTableMeta(table *Table) error {
 	return tm.persistTableMeta(table)
@@ -645,10 +710,100 @@ func setPrevPageID(data []byte, id uint32) {
 	binary.LittleEndian.PutUint32(data[24:28], id)
 }
 
-// [28:32] firstDataPage（首数据页ID，冗余存储方便恢复）
-func getFirstDataPage(data []byte) uint32 {
+// [28:32] undoRootPageID（MVCC undo BTree 根页）
+func getUndoRootPageID(data []byte) uint32 {
 	return binary.LittleEndian.Uint32(data[28:32])
 }
-func setFirstDataPage(data []byte, id uint32) {
+func setUndoRootPageID(data []byte, id uint32) {
 	binary.LittleEndian.PutUint32(data[28:32], id)
+}
+
+// === MVCC Undo Log ===
+
+// UndoRecord undo 日志记录
+type UndoRecord struct {
+	UndoID    uint64        // 自增 ID
+	TrxID     uint64        // 创建该 undo 的事务 ID（修改后版本的 TrxID）
+	OldTrxID  uint64        // 修改前版本的 TrxID
+	TableName string        // 表名
+	RowID     int           // 行 ID
+	OldValues []interface{} // 修改前的值（UPDATE 用；INSERT 为空）
+	RollPtr   uint64        // 指向更老的 undo record（0 表示无）
+	Type      byte          // 1=INSERT, 2=UPDATE
+}
+
+// loadOrCreateUndoBTree 从 page 0 加载或创建 undo BTree
+func (tm *TableManager) loadOrCreateUndoBTree() {
+	metaPage := tm.pager.GetPage(0)
+	undoRoot := getUndoRootPageID(metaPage.Data())
+	if undoRoot == 0 {
+		// 未创建过，新建
+		bt := NewBTree(tm.pager)
+		undoRoot = bt.rootPageID
+		setUndoRootPageID(metaPage.Data(), undoRoot)
+		metaPage.SetDirty(true)
+		tm.pager.Flush(0)
+		tm.undoBTree = bt
+	} else {
+		tm.undoBTree = LoadBTree(tm.pager, undoRoot)
+	}
+}
+
+// persistUndoRoot 持久化 undo BTree 根页 ID
+func (tm *TableManager) persistUndoRoot() error {
+	metaPage := tm.pager.GetPage(0)
+	setUndoRootPageID(metaPage.Data(), tm.undoBTree.rootPageID)
+	metaPage.SetDirty(true)
+	return tm.pager.Flush(0)
+}
+
+// WriteUndoRecord 写入 undo record，返回 undoID
+func (tm *TableManager) WriteUndoRecord(trxID uint64, tableName string, rowID int, oldValues []interface{}, oldTrxID uint64, rollPtr uint64, typ byte) (uint64, error) {
+	undoID := tm.nextUndoID
+	tm.nextUndoID++
+
+	rec := UndoRecord{
+		UndoID:    undoID,
+		TrxID:     trxID,
+		OldTrxID:  oldTrxID,
+		TableName: tableName,
+		RowID:     rowID,
+		OldValues: oldValues,
+		RollPtr:   rollPtr,
+		Type:      typ,
+	}
+
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return 0, fmt.Errorf("marshal undo: %w", err)
+	}
+
+	if err := tm.undoBTree.Insert(EncodeIntKey(int(undoID)), data); err != nil {
+		return 0, fmt.Errorf("undo btree insert: %w", err)
+	}
+	if tm.undoBTree.rootPageID != tm.undoBTree.RootPageID() {
+		// 根页变了，持久化
+		if err := tm.persistUndoRoot(); err != nil {
+			return 0, err
+		}
+	}
+
+	return undoID, nil
+}
+
+// ReadUndoRecord 读取 undo record
+func (tm *TableManager) ReadUndoRecord(undoID uint64) (*UndoRecord, error) {
+	data, found, err := tm.undoBTree.Search(EncodeIntKey(int(undoID)))
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("undo record %d not found", undoID)
+	}
+
+	var rec UndoRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, fmt.Errorf("unmarshal undo: %w", err)
+	}
+	return &rec, nil
 }

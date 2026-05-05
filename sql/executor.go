@@ -562,6 +562,20 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) (Result, error) {
 			}
 		}
 
+		// 写入 undo log（保存修改前的完整值）
+		var oldValues []interface{}
+		for _, v := range row.Values {
+			oldValues = append(oldValues, v)
+		}
+		var rollPtr uint64
+		if row.TrxID != 0 {
+			rollPtr = row.RollPtr
+		}
+		undoID, err := e.tm.WriteUndoRecord(1, stmt.TableName, rowID, oldValues, row.TrxID, rollPtr, 2) // 2=UPDATE
+		if err != nil {
+			return nil, fmt.Errorf("write undo: %w", err)
+		}
+
 		// 应用 SET
 		for colName, val := range setValues {
 			for j, col := range table.Columns {
@@ -575,6 +589,10 @@ func (e *Executor) executeUpdate(stmt *UpdateStmt) (Result, error) {
 				}
 			}
 		}
+
+		// 更新 MVCC 元信息（TODO: trx_id 应从当前活跃事务获取）
+		row.TrxID = 1
+		row.RollPtr = undoID
 
 		// 重新序列化并覆盖聚簇索引
 		rowData, err := table.SerializeRow(row)
